@@ -25,3 +25,12 @@ Non-negotiables for new work:
   requires it.
 - Style with the design tokens in `src/app/globals.css`, not hard-coded colors.
 - Do not add mock APIs or scaffolding for features that are not being built.
+- All project persistence goes through the `ProjectRepository` abstraction in
+  `src/data/projects/`. No component may touch `localStorage`, mint project ids
+  or stamp timestamps — the repository owns that. Its browser-local
+  implementation is temporary and must stay swappable for a database.
+- Project ids are immutable: renaming changes the name and `updatedAt` only.
+- `ProjectWorkspaceProvider` resolves `[projectId]` once for the whole
+  workspace; section pages read context instead of loading the project.
+- Run `npm run lint`, `npm run typecheck`, `npm test` and `npm run build` before
+  calling work done.

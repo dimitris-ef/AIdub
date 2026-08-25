@@ -14,8 +14,8 @@ export function AppSidebar() {
         <PrimaryNav />
       </nav>
       <div className="p-4 text-[11px] leading-relaxed text-muted-foreground">
-        <p className="font-medium text-foreground/70">Part 1 · Foundation</p>
-        <p>Media, AI and persistence arrive in later parts.</p>
+        <p className="font-medium text-foreground/70">Part 2 · Projects</p>
+        <p>Media and AI processing arrive in later parts.</p>
       </div>
     </aside>
   );

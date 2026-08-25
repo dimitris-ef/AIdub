@@ -1,18 +1,14 @@
-import { WorkspaceHeader } from "@/components/workspace/workspace-header";
-import { MediaStageSlot } from "@/components/workspace/media-stage-slot";
-import { TimelineSlot } from "@/components/workspace/timeline-slot";
+import { ProjectWorkspaceProvider } from "@/components/workspace/project-workspace-provider";
+import { WorkspaceShell } from "@/components/workspace/workspace-shell";
 
 /**
  * Shared project workspace layout.
  *
- *   WorkspaceHeader (project context + section navigation)
- *   MediaStageSlot  (reserved for the future persistent player)
- *   children        (the active workspace section)
- *   TimelineSlot    (reserved for the future dubbing timeline)
- *
- * Everything a future part needs to keep alive across sections — playback
- * state, timeline state, selection — belongs at this level. Sections stay
- * route-based, so navigating between them swaps only `children`.
+ * The provider resolves `[projectId]` once and shares it with every section;
+ * `WorkspaceShell` owns the chrome plus the reserved slots for the future
+ * persistent player and dubbing timeline. Sections stay route-based, so
+ * navigating between them swaps only `children` — the shell, and later the
+ * player and timeline state it holds, stay mounted.
  */
 export default async function ProjectWorkspaceLayout(
   props: LayoutProps<"/projects/[projectId]">,
@@ -20,15 +16,8 @@ export default async function ProjectWorkspaceLayout(
   const { projectId } = await props.params;
 
   return (
-    <div className="flex flex-1 flex-col">
-      <WorkspaceHeader projectId={projectId} />
-
-      <div className="flex flex-1 flex-col gap-5 p-4 lg:p-6 xl:flex-row xl:gap-6">
-        <MediaStageSlot className="xl:w-[24rem] xl:shrink-0" />
-        <div className="min-w-0 flex-1">{props.children}</div>
-      </div>
-
-      <TimelineSlot />
-    </div>
+    <ProjectWorkspaceProvider projectId={projectId}>
+      <WorkspaceShell>{props.children}</WorkspaceShell>
+    </ProjectWorkspaceProvider>
   );
 }
