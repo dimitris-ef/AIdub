@@ -29,6 +29,12 @@ export interface Project {
   /** Language code from src/lib/languages.ts. */
   targetLanguage: string;
   status: ProjectStatus;
+  /**
+   * Reference to the project's source video (`ProjectMedia.id`), or null when
+   * no source media has been imported. The media record and its bytes live in
+   * the media layer — never inline in the project.
+   */
+  sourceMediaId: string | null;
 }
 
 export interface CreateProjectInput {
@@ -42,6 +48,8 @@ export interface UpdateProjectInput {
   sourceLanguage?: string;
   targetLanguage?: string;
   status?: ProjectStatus;
+  /** null detaches the source media reference. */
+  sourceMediaId?: string | null;
 }
 
 /** Every project starts here; status progression is not implemented yet. */

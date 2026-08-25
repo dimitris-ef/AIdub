@@ -8,10 +8,12 @@ contains:
 - **Part 2: Project Dashboard and Project Structure** — a functional project
   management layer (create, open, rename, delete) and a project workspace that
   loads real project metadata.
+- **Part 3: Video Upload and Project Media** — importing, validating,
+  inspecting, previewing, replacing and removing a project's source video.
 
-There is still **no** dubbing functionality: no media, transcription,
-translation, voices, mixing or export. Those build on this foundation in later
-parts.
+There is still **no** dubbing functionality: no transcription, translation,
+voices, mixing or export, and no media processing of any kind. Those build on
+this foundation in later parts.
 
 ## Stack
 
@@ -65,7 +67,7 @@ Vercel web layer, behind the service boundaries described below.
 | `/`                                  | Redirects to `/projects` (there is no marketing page)     |
 | `/projects`                          | Projects dashboard: create, open, rename, delete          |
 | `/projects/[projectId]`              | Redirects to the workspace's default section (`media`)    |
-| `/projects/[projectId]/media`        | Media section (placeholder)                               |
+| `/projects/[projectId]/media`        | Media section — source video import, preview, replace     |
 | `/projects/[projectId]/transcript`   | Transcript section (placeholder)                          |
 | `/projects/[projectId]/translate`    | Translate section (placeholder)                           |
 | `/projects/[projectId]/voices`       | Voices section (placeholder)                              |
@@ -98,12 +100,15 @@ src/
 │   ├── workspace/           # workspace header, section nav, reserved slots
 │   └── ui/                  # shadcn/ui primitives
 ├── components/projects/     # dashboard, cards, dialogs, status badge
+├── components/media/        # media workspace, picker, player, details, dialogs
 ├── components/workspace/    # workspace provider, shell, header, section nav, slots
 ├── data/projects/           # ProjectRepository contract + browser-local implementation
-├── hooks/                   # useProjects
-├── lib/                     # navigation config, languages, dates, status, validation, cn()
-├── services/                # boundary for future external processing (see README there)
-└── types/                   # project + navigation domain types
+├── data/media/              # MediaStorage contract + IndexedDB implementation
+├── services/                # application services + future processing boundary
+├── hooks/                   # useProjects, useSourceMedia
+├── lib/                     # navigation, languages, dates, status, validation, cn()
+├── lib/media/               # container detection, validation, metadata, formatters
+└── types/                   # project, media and navigation domain types
 ```
 
 ## Architecture
@@ -211,9 +216,10 @@ media, transcript and render models independent of it.
 | `sourceLanguage` | `string`        | language code from `src/lib/languages.ts`           |
 | `targetLanguage` | `string`        | language code, must differ from the source          |
 | `status`         | `ProjectStatus` | see below                                           |
+| `sourceMediaId`  | `string \| null` | added in Part 3: reference to the source video      |
 
-The id never changes — renaming a project keeps its id, `createdAt`, languages
-and status.
+The id never changes — renaming a project keeps its id, `createdAt`, languages,
+status and source media.
 
 ### Project status model
 
@@ -290,15 +296,186 @@ load the project themselves, and "Project not found" is only shown after loading
 finishes. The workspace header shows the real project name, language pair and
 status.
 
+## Part 3: Video Upload and Project Media
+
+Part 3 makes the Media section functional: a project can import one source
+video, inspect its metadata, preview it, replace it and remove it. No media is
+processed — the file is stored and played back exactly as selected.
+
+### Media data model
+
+`src/types/media.ts` defines `ProjectMedia`, the metadata record for one media
+asset. Bytes are stored separately and are never embedded in this record or in
+the project.
+
+| Field             | Type                | Notes                                            |
+| ----------------- | ------------------- | ------------------------------------------------ |
+| `id`              | `string`            | `crypto.randomUUID()`; stable and immutable       |
+| `projectId`       | `string`            | the owning project                                |
+| `kind`            | `"video"`           | only source video exists in Part 3                |
+| `filename`        | `string`            | as reported by the browser; rendered as text only |
+| `mimeType`        | `string`            | may be empty when the OS reports nothing          |
+| `container`       | `"MP4" \| "MOV" \| "WebM" \| null` | derived from extension + MIME     |
+| `sizeBytes`       | `number`            | canonical size; formatted only for display        |
+| `durationSeconds` | `number \| null`    | from browser metadata                             |
+| `width`/`height`  | `number \| null`    | from browser metadata                             |
+| `createdAt`       | `string`            | ISO 8601                                          |
+| `updatedAt`       | `string`            | ISO 8601                                          |
+
+### Project relationship
+
+A project points at its source video with `project.sourceMediaId` and nothing
+more — the media record owns its own metadata, and the bytes live in the media
+storage layer. This keeps project metadata small and makes the later move to a
+database plus object storage a change of two implementations rather than a
+rewrite.
+
+**Migration from Part 2:** `sourceMediaId` is additive and nullable, so the
+project parser defaults missing values to `null` and Part 2 records keep
+working. No destructive schema change was needed, and the project storage key
+stays `aidub.projects.v1`.
+
+### Development media storage
+
+Source video bytes are stored **in the visitor's browser** using IndexedDB
+(`database "aidub"`, stores `mediaMetadata` and `mediaBlobs`, each indexed by
+`projectId`). IndexedDB — not `localStorage` — because it is the only browser
+store that can hold multi-gigabyte Blobs.
+
+This is temporary development storage:
+
+- it is **not** production cloud storage and **not** synced between browsers or
+  devices;
+- it is subject to browser storage quotas and eviction policies, and behaves
+  differently in private/incognito windows;
+- clearing site data deletes the videos (the app recovers — see below);
+- nothing is uploaded anywhere: no network request carries the file.
+
+Quota and availability failures surface as readable messages ("The browser
+could not store this video locally…") instead of crashing.
+
+### Media storage abstraction
+
+`MediaStorage` (`src/data/media/media-storage.ts`) is the contract:
+`save`, `getMetadata`, `getBlob`, `listByProject`, `delete`, `deleteByProject`.
+`IndexedDbMediaStorage` is the only file in the codebase that knows IndexedDB
+exists; the binding lives in `src/data/media/index.ts`. **UI never touches
+IndexedDB.** A production implementation backed by signed uploads and object
+storage replaces that binding without UI changes.
+
+Above it, `ProjectMediaService`
+(`src/services/media/project-media-service.ts`) coordinates the lifecycle:
+validation, metadata extraction, storage writes, project updates, replacement
+cleanup and status transitions. Components call the service; they never
+orchestrate the repository and storage themselves.
+
+### Import and validation
+
+Selecting a file (picker or drag-and-drop) runs, in order:
+
+1. **File validation** — non-empty; container recognised from the *extension*
+   and the reported MIME type together, since either can be missing or wrong.
+2. **Browser metadata load** — which doubles as proof the browser can decode
+   the file.
+3. **Storage write**, then **project association**.
+
+Nothing is associated with a project until validation succeeds, and a failure
+after the write removes the freshly stored media so no orphan is left behind.
+
+Errors are actionable, never raw exceptions: "This file type is not supported.
+Use MP4, MOV, or WebM.", "This file is empty…", "The selected file could not be
+read as a video…".
+
+### Browser metadata, not codec inspection
+
+`duration`, `videoWidth` and `videoHeight` come from a temporary `<video>`
+element and its `loadedmetadata` event; the temporary object URL is revoked
+immediately afterwards. There is no FFmpeg, no WASM demuxer and no container
+parser, so Aidub reports no codec or bitrate information and shows "Unknown"
+rather than guessing.
+
+### Container vs codec
+
+MP4/MOV/WebM support means Aidub **accepts those containers**. Whether a file
+actually plays depends on the codecs inside it and on the browser: a `.mov`
+carrying ProRes, or an MP4 carrying H.265, may be unplayable in a browser that
+decodes neither, and codec support differs between Chromium, Safari and
+Firefox. When the browser cannot decode a stored file, the project keeps its
+media and metadata and the preview area explains the situation while Replace
+and Remove stay available.
+
+### Preview
+
+A native `<video controls>` element plays the stored blob through an ephemeral
+object URL created when the media loads and revoked when it changes or the
+component unmounts. Object URLs are never persisted or used as identifiers.
+There is no autoplay, and no custom transport controls — Aidub's own player and
+the dubbing timeline arrive with the persistent workspace player.
+
+### Replace and remove
+
+**Replace** validates and stores the new file *before* touching the project.
+Only after the project points at the new media is the previous copy deleted, so
+a failed replacement leaves the original source intact and playable. **Remove**
+requires a confirmation, detaches the project first and then deletes the stored
+copy; if the copy cannot be deleted, the project is still consistent and the
+user is told.
+
+### Project status behaviour
+
+| Event                   | Status  |
+| ----------------------- | ------- |
+| No source media         | `draft` |
+| Source media imported   | `ready` |
+| Source media replaced   | `ready` |
+| Source media removed    | `draft` |
+
+`ready` means "source media exists and the project is ready for future
+processing". `processing`, `completed` and `error` are reserved for the
+processing pipeline that later parts introduce, so Part 3 never sets them — a
+failed import leaves the project's previous valid state untouched.
+
+### Missing media recovery
+
+If a project references media whose metadata or bytes are gone (browser storage
+cleared, quota eviction), the Media section shows a recoverable "Source video
+unavailable" state offering to import a replacement or remove the reference. It
+never crashes and never deletes project data on its own.
+
+### Project deletion and media cleanup
+
+Deleting a project goes through `deleteProjectWithMedia`
+(`src/services/projects/delete-project.ts`), which purges the project's media
+from storage first and then deletes the project. A cleanup failure does not
+block the deletion the user asked for; it is reported instead.
+
+### Future processing boundary
+
+`src/services/media/media-processing.ts` documents where transcoding, waveform
+generation, transcription, diarization, translation, speech synthesis and
+rendering will connect. It contains types and documentation only — no client,
+no fake network calls, no API routes. Future jobs will reference stable
+`projectId` and `mediaId` values and read bytes from production object storage,
+not from the browser.
+
+### Vercel
+
+Vercel hosts the Aidub web application. Large permanent video assets will never
+live in the deployment filesystem, and Part 3 writes nothing on the server:
+source videos stay in the visitor's browser. Production media will live in
+object storage behind a media backend, and heavy processing will run on
+external workers outside the lightweight Vercel web layer.
+
 ## Not implemented (on purpose)
 
-Authentication, accounts, billing, a production database, file uploads, media
-storage, FFmpeg/transcoding, waveform generation, background jobs, queues,
-workers, transcription, diarization, translation, LLM integration, TTS, voice
-cloning, media playback, the dubbing timeline, export/render processing,
-analytics and collaboration are all still out of scope. There are no placeholder
-or mock API routes for them; the app ships with no `app/api` directory at all.
-Project persistence exists only in the temporary browser-local form described
+Authentication, accounts, billing, a production database, cloud media storage,
+FFmpeg/transcoding, audio extraction, proxy or thumbnail generation, waveform
+generation, background jobs, queues, workers, transcription, diarization,
+translation, LLM integration, TTS, voice cloning, the persistent workspace
+player, the dubbing timeline, export/render processing, analytics and
+collaboration are all still out of scope. There are no placeholder or mock API
+routes for them; the app ships with no `app/api` directory at all. Project and
+media persistence exist only in the temporary browser-local forms described
 above.
 
 ## Architectural decisions later parts must preserve
@@ -336,3 +513,26 @@ Part 2 adds:
     section**.
 18. Project resolution happens **once**, at the shared workspace level; future
     player and timeline state belongs there too, never in section pages.
+
+Part 3 adds:
+
+19. A project has **at most one primary source video** for now.
+20. Projects reference media by **stable media id**; binary media is never
+    embedded in project metadata, and media metadata is kept separate from the
+    bytes.
+21. **UI never accesses IndexedDB** (or any storage) directly — all media
+    persistence goes through the `MediaStorage` abstraction, and all
+    project/media coordination through the service layer.
+22. Development media persistence is **temporary and replaceable**; production
+    media will live in external object storage behind a backend.
+23. Large media must **never** depend on Vercel deployment filesystem
+    persistence, and heavy processing stays outside the Vercel web layer.
+24. **Media validation happens before** any project association changes.
+25. **Replacement preserves the old source** until the new one commits
+    successfully.
+26. Object URLs are **ephemeral** and must never be persisted as identifiers.
+27. Browser metadata extraction is **not** codec inspection — no FFmpeg, no
+    container parsing.
+28. Future processing jobs reference stable `projectId` and `mediaId`.
+29. Deleting a project **cleans up its media**; renaming a project **never**
+    touches the media association.

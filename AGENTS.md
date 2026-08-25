@@ -32,5 +32,13 @@ Non-negotiables for new work:
 - Project ids are immutable: renaming changes the name and `updatedAt` only.
 - `ProjectWorkspaceProvider` resolves `[projectId]` once for the whole
   workspace; section pages read context instead of loading the project.
+- Media bytes go through the `MediaStorage` abstraction in `src/data/media/`;
+  no component may touch IndexedDB, and no video bytes may be put in
+  localStorage, the repo, `public/`, or any server filesystem.
+- Project/media coordination (import, replace, remove, cleanup on project
+  delete) belongs to the services in `src/services/`, not to components.
+- Media validation runs before any project association changes, and a
+  replacement keeps the old source until the new one commits.
+- Object URLs are ephemeral: revoke them, never persist them as identifiers.
 - Run `npm run lint`, `npm run typecheck`, `npm test` and `npm run build` before
   calling work done.

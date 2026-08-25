@@ -286,7 +286,9 @@ describe("LocalProjectRepository", () => {
         ]),
       );
 
-      await expect(context.repository.list()).resolves.toEqual([valid]);
+      await expect(context.repository.list()).resolves.toEqual([
+        { ...valid, sourceMediaId: null },
+      ]);
     });
 
     it("falls back to draft for an unrecognised status", () => {
@@ -312,6 +314,85 @@ describe("LocalProjectRepository", () => {
     });
   });
 
+  describe("source media reference", () => {
+    it("creates projects with no source media", async () => {
+      const project = await context.repository.create(validInput);
+
+      expect(project.sourceMediaId).toBeNull();
+    });
+
+    it("stores and clears the source media reference", async () => {
+      const created = await context.repository.create(validInput);
+
+      const associated = await context.repository.update(created.id, {
+        sourceMediaId: "media-1",
+        status: "ready",
+      });
+      expect(associated).toMatchObject({
+        sourceMediaId: "media-1",
+        status: "ready",
+      });
+
+      const detached = await context.repository.update(created.id, {
+        sourceMediaId: null,
+        status: "draft",
+      });
+      expect(detached).toMatchObject({ sourceMediaId: null, status: "draft" });
+    });
+
+    it("keeps the media reference when a project is renamed", async () => {
+      const created = await context.repository.create(validInput);
+      await context.repository.update(created.id, {
+        sourceMediaId: "media-1",
+        status: "ready",
+      });
+
+      const renamed = await context.repository.update(created.id, {
+        name: "Renamed",
+      });
+
+      expect(renamed).toMatchObject({
+        id: created.id,
+        name: "Renamed",
+        sourceMediaId: "media-1",
+        status: "ready",
+      });
+    });
+
+    it("migrates Part 2 records that predate source media", async () => {
+      context.storage.setItem(
+        PROJECTS_STORAGE_KEY,
+        JSON.stringify([
+          {
+            id: "legacy",
+            name: "Part 2 project",
+            createdAt: "2026-08-25T10:00:00.000Z",
+            updatedAt: "2026-08-25T10:00:00.000Z",
+            sourceLanguage: "en",
+            targetLanguage: "pl",
+            status: "draft",
+          },
+        ]),
+      );
+
+      const [migrated] = await context.repository.list();
+
+      expect(migrated).toMatchObject({
+        id: "legacy",
+        name: "Part 2 project",
+        sourceMediaId: null,
+      });
+    });
+
+    it("rejects a malformed media reference", async () => {
+      const created = await context.repository.create(validInput);
+
+      await expect(
+        context.repository.update(created.id, { sourceMediaId: "  " }),
+      ).rejects.toBeInstanceOf(ProjectValidationError);
+    });
+  });
+
   it("round-trips serialization through storage", async () => {
     const created = await context.repository.create(validInput);
     const rehydrated = new LocalProjectRepository({ storage: context.storage });
@@ -329,6 +410,7 @@ describe("sortProjectsByRecency", () => {
     sourceLanguage: "en",
     targetLanguage: "pl",
     status: "draft",
+    sourceMediaId: null,
   });
 
   it("does not mutate the input", () => {

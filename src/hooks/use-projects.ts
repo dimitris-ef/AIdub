@@ -4,6 +4,10 @@ import { useCallback, useEffect, useState } from "react";
 
 import { projectRepository } from "@/data/projects";
 import type { ProjectRepository } from "@/data/projects";
+import {
+  deleteProjectWithMedia,
+  type DeleteProjectResult,
+} from "@/services/projects/delete-project";
 import type {
   CreateProjectInput,
   Project,
@@ -22,7 +26,13 @@ export interface UseProjectsResult {
   reload: () => Promise<void>;
   createProject: (input: CreateProjectInput) => Promise<Project>;
   updateProject: (id: string, input: UpdateProjectInput) => Promise<Project>;
-  deleteProject: (id: string) => Promise<void>;
+  deleteProject: (id: string) => Promise<DeleteProjectResult>;
+}
+
+export interface UseProjectsOptions {
+  repository?: ProjectRepository;
+  /** Deletion is coordinated so a project's stored media is cleaned up too. */
+  deleteProject?: (id: string) => Promise<DeleteProjectResult>;
 }
 
 function toMessage(error: unknown, fallback: string): string {
@@ -33,9 +43,10 @@ function toMessage(error: unknown, fallback: string): string {
  * Dashboard data access. Everything goes through the injected repository, so
  * the dashboard has no idea where projects are stored.
  */
-export function useProjects(
-  repository: ProjectRepository = projectRepository,
-): UseProjectsResult {
+export function useProjects({
+  repository = projectRepository,
+  deleteProject: deleteProjectFn = (id) => deleteProjectWithMedia(id),
+}: UseProjectsOptions = {}): UseProjectsResult {
   // `null` until the first load resolves, which is what drives the loading UI.
   const [snapshot, setSnapshot] = useState<ProjectsSnapshot | null>(null);
 
@@ -94,10 +105,11 @@ export function useProjects(
 
   const deleteProject = useCallback(
     async (id: string) => {
-      await repository.delete(id);
+      const result = await deleteProjectFn(id);
       await refresh();
+      return result;
     },
-    [repository, refresh],
+    [deleteProjectFn, refresh],
   );
 
   return {

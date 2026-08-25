@@ -40,8 +40,9 @@ export function MediaStageSlot({ className }: { className?: string }) {
       </div>
 
       <p className="text-xs leading-relaxed text-muted-foreground">
-        Playback belongs to the project layout, not to individual sections, so
-        it can survive section navigation once it exists.
+        Source video preview lives in the Media section for now. Playback
+        belongs to the project layout, not to individual sections, so it can
+        survive section navigation once the persistent player exists.
       </p>
     </section>
   );

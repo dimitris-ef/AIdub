@@ -52,8 +52,8 @@ export function DeleteProjectDialog({
             Delete “{project?.name ?? "project"}”?
           </AlertDialogTitle>
           <AlertDialogDescription>
-            This permanently removes the project and its settings from this
-            browser. It cannot be undone.
+            This permanently removes the project, its settings and the copy of
+            its source video stored in this browser. It cannot be undone.
           </AlertDialogDescription>
         </AlertDialogHeader>
 

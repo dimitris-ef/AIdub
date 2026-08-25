@@ -72,6 +72,11 @@ function isIsoTimestamp(value: unknown): value is string {
  * hand-edited, so anything structurally broken is dropped rather than trusted.
  * A record whose status is not recognised keeps its other data and falls back
  * to the initial status instead of being discarded.
+ *
+ * This parser is also the migration path for records written before Part 3:
+ * `sourceMediaId` is an additive, nullable field, so a Part 2 record without it
+ * loads as a project with no source media instead of being invalidated. That is
+ * why the storage key stays at v1 — no destructive schema change was needed.
  */
 export function parseStoredProject(value: unknown): Project | null {
   if (typeof value !== "object" || value === null) {
@@ -101,6 +106,9 @@ export function parseStoredProject(value: unknown): Project | null {
     status: isProjectStatus(record.status)
       ? record.status
       : INITIAL_PROJECT_STATUS,
+    sourceMediaId: isNonEmptyString(record.sourceMediaId)
+      ? record.sourceMediaId
+      : null,
   };
 }
 
@@ -151,6 +159,7 @@ export class LocalProjectRepository implements ProjectRepository {
       sourceLanguage: input.sourceLanguage,
       targetLanguage: input.targetLanguage,
       status: INITIAL_PROJECT_STATUS,
+      sourceMediaId: null,
     };
 
     this.write([...this.read(), project]);
@@ -183,12 +192,24 @@ export class LocalProjectRepository implements ProjectRepository {
       throw new ProjectValidationError("Unknown project status.");
     }
 
+    if (
+      input.sourceMediaId !== undefined &&
+      input.sourceMediaId !== null &&
+      !isNonEmptyString(input.sourceMediaId)
+    ) {
+      throw new ProjectValidationError("Invalid source media reference.");
+    }
+
     const updated: Project = {
       ...current,
       name,
       sourceLanguage,
       targetLanguage,
       status: input.status ?? current.status,
+      sourceMediaId:
+        input.sourceMediaId === undefined
+          ? current.sourceMediaId
+          : input.sourceMediaId,
       updatedAt: this.now().toISOString(),
     };
 

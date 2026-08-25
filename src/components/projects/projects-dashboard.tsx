@@ -66,8 +66,17 @@ export function ProjectsDashboard() {
 
   async function handleDelete(project: Project) {
     try {
-      await deleteProject(project.id);
+      const { mediaCleanupFailed } = await deleteProject(project.id);
       setDeleteTarget(null);
+
+      if (mediaCleanupFailed) {
+        toast.warning(`Deleted “${project.name}”`, {
+          description:
+            "Its locally stored video copy could not be removed from this browser.",
+        });
+        return;
+      }
+
       toast.success(`Deleted “${project.name}”`);
     } catch (cause) {
       toast.error(errorMessage(cause, "Could not delete the project."));
