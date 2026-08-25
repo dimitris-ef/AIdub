@@ -10,10 +10,13 @@ contains:
   loads real project metadata.
 - **Part 3: Video Upload and Project Media** — importing, validating,
   inspecting, previewing, replacing and removing a project's source video.
+- **Part 4: Backend Media-Processing Foundation** — a server-side processing
+  job pipeline (FFprobe inspection and canonical audio extraction) that later
+  AI stages will run through.
 
-There is still **no** dubbing functionality: no transcription, translation,
-voices, mixing or export, and no media processing of any kind. Those build on
-this foundation in later parts.
+There is still **no** dubbing functionality: no transcription, diarization,
+translation, voices, mixing or export. Those build on this foundation in later
+parts.
 
 ## Stack
 
@@ -25,6 +28,7 @@ this foundation in later parts.
 | UI kit      | shadcn/ui primitives (Radix + lucide icons)  |
 | Toasts      | sonner                                       |
 | Tests       | Vitest                                       |
+| Media tools | FFmpeg + FFprobe, behind a backend adapter   |
 | Hosting     | Vercel                                       |
 
 ## Local development
@@ -46,6 +50,22 @@ npm start          # serve a production build locally
 ```
 
 Localhost is a development environment only — it is not the deployment story.
+
+### FFmpeg for local processing
+
+Part 4's processing jobs shell out to FFmpeg and FFprobe. `npm install` brings
+in `@ffmpeg-installer/ffmpeg` and `@ffprobe-installer/ffprobe` as
+devDependencies, so a local checkout works with no extra setup. The binaries
+are resolved at runtime in this order:
+
+1. `FFMPEG_PATH` / `FFPROBE_PATH` environment variables
+2. the installer packages above
+3. `ffmpeg` / `ffprobe` on `PATH`
+
+Nothing is hard-coded to a machine-specific path, and no build step requires
+the binaries. When neither is available the app still runs: the processing API
+reports the capability as unavailable and the Media workspace explains that
+media jobs cannot run, instead of failing job by job.
 
 ## Production
 
@@ -74,6 +94,18 @@ Vercel web layer, behind the service boundaries described below.
 | `/projects/[projectId]/mix`          | Mix section (placeholder)                                 |
 | `/projects/[projectId]/export`       | Export section (placeholder)                              |
 | `/settings`                          | Settings placeholder                                      |
+
+Processing API (Node runtime, see Part 4):
+
+| Route                                       | Purpose                                     |
+| ------------------------------------------- | ------------------------------------------- |
+| `POST /api/processing/jobs`                 | Create a processing job                      |
+| `GET /api/processing/jobs`                  | Job history for a project / source media     |
+| `DELETE /api/processing/jobs`               | Cancel + purge a project's or media's jobs   |
+| `GET /api/processing/jobs/[jobId]`          | Read one job (scoped to its project)         |
+| `POST /api/processing/jobs/[jobId]/cancel`  | Cancel a queued or running job               |
+| `GET /api/processing/artifacts/[artifactId]`| Download a generated artifact                |
+| `GET /api/processing/capabilities`          | Whether FFmpeg/FFprobe are available         |
 
 Workspace routes load the project identified by `[projectId]`. An id that does
 not exist in this browser renders a "Project not found" state with a route back
@@ -104,7 +136,11 @@ src/
 ├── components/workspace/    # workspace provider, shell, header, section nav, slots
 ├── data/projects/           # ProjectRepository contract + browser-local implementation
 ├── data/media/              # MediaStorage contract + IndexedDB implementation
-├── services/                # application services + future processing boundary
+├── server/processing/       # job service, MediaProcessor, FFmpeg adapter, temp files
+├── server/artifacts/        # generated-artifact storage
+├── app/api/processing/      # processing job + artifact routes (Node runtime)
+├── components/processing/   # job panel, status badge, progress, results
+├── services/                # application services + processing client
 ├── hooks/                   # useProjects, useSourceMedia
 ├── lib/                     # navigation, languages, dates, status, validation, cn()
 ├── lib/media/               # container detection, validation, metadata, formatters
@@ -451,12 +487,11 @@ block the deletion the user asked for; it is reported instead.
 
 ### Future processing boundary
 
-`src/services/media/media-processing.ts` documents where transcoding, waveform
-generation, transcription, diarization, translation, speech synthesis and
-rendering will connect. It contains types and documentation only — no client,
-no fake network calls, no API routes. Future jobs will reference stable
-`projectId` and `mediaId` values and read bytes from production object storage,
-not from the browser.
+`src/services/media/media-processing.ts` documented where processing would
+connect; Part 4 implements that boundary as real processing jobs (see below).
+The rule it established still holds: jobs reference stable `projectId` and
+`mediaId` values, and in production a worker reads the bytes from object
+storage rather than from the browser.
 
 ### Vercel
 
@@ -466,14 +501,233 @@ source videos stay in the visitor's browser. Production media will live in
 object storage behind a media backend, and heavy processing will run on
 external workers outside the lightweight Vercel web layer.
 
+## Part 4: Backend Media-Processing Foundation
+
+Part 4 adds the first real server-side processing layer. It does not dub
+anything: it establishes the job pipeline, the FFmpeg boundary and the artifact
+model that transcription, diarization, translation, speech synthesis and
+rendering will all run through later.
+
+The layering is strict:
+
+```text
+Media workspace UI
+  → ProcessingClient            (frontend contract: jobs, never commands)
+    → /api/processing/*         (Node runtime route handlers)
+      → ProcessingService       (validation, lifecycle, progress, cleanup)
+        → MediaProcessor        (probe / extractAudio / convert)
+          → FfmpegMediaProcessor (the only file that knows FFmpeg exists)
+            → job-scoped temporary files
+```
+
+Nothing above `FfmpegMediaProcessor` builds a command line, spawns a process,
+knows a binary path or touches a temp directory — and nothing below the client
+knows whether the work ran in this process, on a worker, or on another machine.
+
+### Processing job model
+
+`src/types/processing-job.ts`:
+
+| Field           | Type                    | Notes                                       |
+| --------------- | ----------------------- | ------------------------------------------- |
+| `id`            | `string`                | stable job id                                |
+| `projectId`     | `string`                | every job belongs to a project               |
+| `sourceMediaId` | `string`                | and to the exact media it processed          |
+| `type`          | `ProcessingJobType`     | `probe_media` · `extract_audio` · `convert_media` |
+| `status`        | `ProcessingJobStatus`   | see the lifecycle below                      |
+| `progress`      | `number`                | normalised 0–100                             |
+| `indeterminate` | `boolean`               | true when no real percentage is available    |
+| `createdAt` / `updatedAt` | `string`      | ISO 8601                                     |
+| `startedAt` / `completedAt` | `string \| null` | ISO 8601, set on start and on any terminal state |
+| `error`         | `ProcessingJobError \| null` | `{ code, message, details? }`          |
+| `result`        | `ProcessingJobResult`   | typed per job type, or null                  |
+
+### Job types
+
+- **`probe_media`** — FFprobe inspection of the source; result is
+  `{ kind: "probe_media", metadata }` with container, duration, video codec /
+  resolution / frame rate and audio codec / sample rate / channels. Anything
+  the file does not expose is `null`, never a guess.
+- **`extract_audio`** — canonical audio extraction; result is
+  `{ kind: "extract_audio", artifact }`.
+- **`convert_media`** — the internal conversion primitive future stages reuse
+  (currently "normalise to canonical audio"). It is not a user-facing
+  transcoder.
+
+Future AI job types (transcribe, diarize, translate, synthesise, dub) are
+**documented intentions only** — none are implemented or stubbed.
+
+### Status lifecycle
+
+```text
+queued → processing → completed
+queued → processing → failed
+queued → cancelled            (never started)
+queued → processing → cancelled
+```
+
+Terminal states are final: `completed → processing` or `failed → completed`
+are rejected by the repository. A retry is a new job.
+
+Progress follows one policy for every job type: `queued` is 0, `processing` is
+1–99 and never moves backwards, `completed` is 100, and `failed`/`cancelled`
+keep the last meaningful value. Extraction and conversion derive real progress
+from FFmpeg's machine-readable `-progress pipe:1` output against the probed
+duration; probing reports `indeterminate` instead of inventing a percentage.
+
+### Errors
+
+Failures are structured (`FFMPEG_NOT_AVAILABLE`, `SOURCE_MEDIA_NOT_FOUND`,
+`PROBE_FAILED`, `NO_AUDIO_STREAM`, `AUDIO_EXTRACTION_FAILED`,
+`CONVERSION_FAILED`, `TEMP_STORAGE_ERROR`, `CANCELLED`, …) with a short,
+actionable message. FFmpeg's full output stays in the server log; only a
+three-line, **path-redacted** summary is retained in `details`, so backend
+filesystem paths never reach the browser. Unexpected exceptions collapse to a
+generic message rather than leaking internals.
+
+### FFmpeg and FFprobe
+
+`FfmpegMediaProcessor` spawns binaries with **argument arrays** (never a shell
+string), so a filename can never be interpolated into a command. It parses
+FFprobe's JSON output (not human-readable console text), reads progress from
+`-progress pipe:1`, terminates children with `SIGTERM` and escalates to
+`SIGKILL` on cancellation, applies a timeout to probing, and exposes a cached
+capability/version check rather than probing the binaries per job.
+
+### Temporary files
+
+Each job gets `<os temp>/aidub/jobs/<jobId>/`, containing a backend-named
+`source.<ext>` (the user's filename never becomes a path) and any generated
+output. `TemporaryFileManager` owns all of it — no `os.tmpdir()`, `mkdir` or
+`rm` calls are scattered through processing code, and job ids and filenames are
+validated so nothing can escape the directory.
+
+Cleanup runs in a `finally` after **success, failure and cancellation**. A
+cleanup failure is logged and never turns a successful job into a failed one;
+nothing project-critical lives there, because artifacts are copied out first.
+Temporary files are never project storage, and never live under `public/` or
+in the repository.
+
+### Extracted audio format
+
+Extraction produces **WAV, mono, 16 kHz, PCM signed 16-bit little-endian**
+(`-map 0:a:0 -ac 1 -ar 16000 -c:a pcm_s16le`). That is the format speech
+systems — transcription and diarization especially — consume without
+resampling, it is lossless relative to what those models actually use, and it
+keeps artifacts small. It is a deliberate default for the speech pipeline, not
+a claim that every future stage wants it: a stage needing stereo or a higher
+rate re-derives it from the source rather than upsampling this artifact.
+
+If the source has no audio track, the job **fails** with `NO_AUDIO_STREAM` and
+the message "No audio track was found in this source video." — no empty file is
+produced and no job is falsely marked complete.
+
+### Processing artifacts
+
+Generated output is a `ProcessingArtifact` (id, project, source media, job,
+type, filename, mime type, size, sample rate, channels, duration, createdAt) —
+deliberately separate from Part 3's source media and from project metadata.
+Source video belongs to the project; artifacts belong to the job that produced
+them.
+
+`ProcessingArtifactStorage` is the boundary. The development implementation
+keeps metadata in the server process and bytes under
+`<os temp>/aidub/artifacts/<artifactId>/`, outside the job directories so they
+survive job cleanup, and serves them through
+`GET /api/processing/artifacts/[artifactId]`. This is **development storage**:
+it does not survive a server restart or temp reclamation, and production
+replaces it with object storage behind the same interface.
+
+### Development job persistence
+
+Jobs live in an in-process store (`InMemoryProcessingJobRepository`). Job
+history is therefore lost when the server restarts and is not shared between
+server instances — acceptable for local development, and replaced by a
+database- or queue-backed `ProcessingJobRepository` in production without
+touching the API contract or the UI.
+
+### Development source transport
+
+Part 3 keeps source video in the browser, which server code cannot read, so a
+job request carries the bytes as a multipart `source` part. This is a
+**development transport, not the storage architecture**: the uploaded bytes are
+written into the job's temp directory, used, and deleted with it — nothing is
+persisted server-side. In production the backend resolves `sourceMediaId` to
+object storage (or a signed URL) and the browser sends no bytes at all; the job
+model, API contract and UI are unchanged by that switch.
+
+The development upload ceiling is 512 MB (`PROCESSING_MAX_UPLOAD_BYTES`).
+Platform request-body limits — Vercel functions cap uploads at a few MB — are
+precisely why routing source media through the web app is temporary.
+
+### Frontend contract
+
+The Media workspace talks to `ProcessingClient` (`src/services/processing/`),
+never to `fetch` directly and never to FFmpeg. It creates jobs, reads them, and
+cancels them; `useProcessingJobs` polls active jobs every 1.5 s with a chained
+timeout (so requests never overlap), stops on any terminal state and on
+unmount, and swallows transient network errors instead of failing the job. A
+future realtime transport replaces the polling inside that hook without
+changing what the UI renders.
+
+### Media workspace integration
+
+With a valid source video the Media section shows a compact **Processing**
+panel: *Inspect source* and *Extract audio* actions (disabled while a job is
+being created, and when the backend reports FFmpeg unavailable), plus recent
+jobs for the **current** source media, newest first — with status badge,
+progress, cancel action while queued or running, concise failure message,
+server-derived probe metadata and a downloadable artifact summary
+("WAV · Mono · 16 kHz · 00:03 · 96.1 KB").
+
+### Project status is not job status
+
+Part 3's semantics are untouched: no source media → `draft`, source present →
+`ready`. Processing state lives in `ProcessingJob.status` alone; a failed probe
+never marks the project itself as errored.
+
+### Source replacement, removal and project deletion
+
+Jobs stay associated with the media id they processed, so replacing a source
+starts a fresh (empty) job list for the new media while the old jobs remain
+historical records. Replacing or removing a source cancels anything still
+running for the old media and drops its generated artifacts; deleting a project
+cancels its jobs, purges its artifacts and its job history, and then deletes the
+project. All of it is coordinated in the service layer, never in components.
+
+### Production worker architecture
+
+The development implementation runs jobs in the web server process. That is a
+convenience, **not the production model**:
+
+```text
+Browser
+  → Vercel-hosted Aidub web app
+    → processing API / job coordinator
+      → external queue → worker infrastructure
+        → FFmpeg / GPU AI workers
+          → object storage
+```
+
+Long-running FFmpeg and AI work is **not** intended to run inside Vercel
+serverless functions: they are time- and size-limited, and heavy media work
+belongs on dedicated compute. Moving execution out means replacing "run it
+here" with "enqueue it" inside `ProcessingService`, and swapping the job
+repository, artifact storage and media source for production implementations —
+`ProcessingJob`, the HTTP contract, the client and the workspace UI stay as
+they are. Nothing in the web build depends on FFmpeg being present: the
+binaries are resolved at runtime, and a deployment without them simply reports
+processing as unavailable.
+
 ## Not implemented (on purpose)
 
 Authentication, accounts, billing, a production database, cloud media storage,
-FFmpeg/transcoding, audio extraction, proxy or thumbnail generation, waveform
-generation, background jobs, queues, workers, transcription, diarization,
+transcoding for delivery, proxy or thumbnail generation, waveform generation,
+real queues and external workers, transcription, diarization, source separation,
 translation, LLM integration, TTS, voice cloning, the persistent workspace
 player, the dubbing timeline, export/render processing, analytics and
-collaboration are all still out of scope. There are no placeholder or mock API
+collaboration are all still out of scope. Part 4 stops at media processing and
+artifact production: the extracted audio is not sent to any AI provider. There are no placeholder or mock API
 routes for them; the app ships with no `app/api` directory at all. Project and
 media persistence exist only in the temporary browser-local forms described
 above.
@@ -536,3 +790,29 @@ Part 3 adds:
 28. Future processing jobs reference stable `projectId` and `mediaId`.
 29. Deleting a project **cleans up its media**; renaming a project **never**
     touches the media association.
+
+Part 4 adds:
+
+30. The frontend interacts with **processing jobs**, never with FFmpeg
+    commands, process ids or backend paths.
+31. FFmpeg/FFprobe usage stays isolated behind `MediaProcessor`; only its
+    adapter knows binary paths, flags, exit codes and signals.
+32. Jobs have stable ids and a typed lifecycle; terminal states are final.
+33. Every job belongs to a `projectId` **and** a `sourceMediaId`, and is only
+    readable through its own project.
+34. Storage and processing stay separate; generated artifacts are separate from
+    project metadata and from source media.
+35. Temporary files are job-scoped and cleaned after success, failure and
+    cancellation; backend paths are never exposed to the frontend.
+36. Untrusted filenames are never shell-interpolated and never become paths.
+37. The browser→backend source upload is a **development transport**;
+    production resolves source media from object storage.
+38. The job API contract must stay stable when execution moves to external
+    workers, and the job model must remain usable with a queue.
+39. Project status is not a substitute for job status.
+40. Long-running processing is never permanently tied to Vercel functions, and
+    FFmpeg runs only in a Node server environment.
+41. Replacing a source creates a new media identity; jobs stay attached to the
+    media they processed.
+42. Future transcription and AI stages consume processing artifacts through
+    this same job architecture.

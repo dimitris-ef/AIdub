@@ -13,6 +13,7 @@ import {
   extractVideoMetadata,
   type ExtractVideoMetadata,
 } from "@/lib/media/extract-video-metadata";
+import { processingClient } from "@/services/processing/processing-client";
 
 /**
  * Coordinates the source-video lifecycle across the project repository and the
@@ -58,12 +59,21 @@ export interface ProjectMediaService {
   purgeProjectMedia(projectId: string): Promise<void>;
 }
 
+/**
+ * Lets media changes tell the processing layer to stop work and drop
+ * artifacts, without this service knowing anything about jobs or FFmpeg.
+ */
+export interface ProcessingCleanup {
+  purge(projectId: string, sourceMediaId?: string): Promise<void>;
+}
+
 export interface ProjectMediaServiceOptions {
   repository?: ProjectRepository;
   storage?: MediaStorage;
   extractMetadata?: ExtractVideoMetadata;
   createId?: () => string;
   now?: () => Date;
+  processing?: ProcessingCleanup;
   /** Technical detail sink; user-facing messages never include stack traces. */
   logger?: (message: string, cause: unknown) => void;
 }
@@ -88,8 +98,18 @@ export function createProjectMediaService({
   extractMetadata = extractVideoMetadata,
   createId = defaultCreateId,
   now = () => new Date(),
+  processing = processingClient,
   logger = defaultLogger,
 }: ProjectMediaServiceOptions = {}): ProjectMediaService {
+  /** Best effort: processing cleanup must never block a media operation. */
+  async function purgeProcessing(projectId: string, sourceMediaId?: string) {
+    try {
+      await processing.purge(projectId, sourceMediaId);
+    } catch (cause) {
+      logger("Could not clean up processing jobs for this media", cause);
+    }
+  }
+
   async function requireProject(projectId: string) {
     const project = await repository.getById(projectId);
 
@@ -196,6 +216,10 @@ export function createProjectMediaService({
         } catch (cause) {
           logger("Could not remove the replaced source video", cause);
         }
+
+        // Jobs stay in history against the media they processed; their
+        // generated artifacts go, and anything still running is stopped.
+        await purgeProcessing(projectId, previousMediaId);
       }
 
       return media;
@@ -215,6 +239,9 @@ export function createProjectMediaService({
       if (!mediaId) {
         return;
       }
+
+      // Stop any processing that is still running against this media.
+      await purgeProcessing(projectId, mediaId);
 
       try {
         await storage.delete(mediaId);

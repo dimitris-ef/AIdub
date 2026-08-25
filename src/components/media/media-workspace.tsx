@@ -23,6 +23,7 @@ import {
 import { SourceVideoPlayer } from "@/components/media/source-video-player";
 import { SourceVideoDetails } from "@/components/media/source-video-details";
 import { RemoveVideoDialog } from "@/components/media/remove-video-dialog";
+import { ProcessingPanel } from "@/components/processing/processing-panel";
 
 /**
  * The Media section: import, inspect, preview, replace and remove a project's
@@ -167,11 +168,14 @@ export function MediaWorkspace() {
       ) : null}
 
       {status === "ready" && media && previewUrl ? (
-        <div className="space-y-4 rounded-lg border border-border bg-card/40 p-4 lg:p-5">
-          <SourceVideoPlayer media={media} previewUrl={previewUrl} />
-          <Separator />
-          <SourceVideoDetails media={media} />
-        </div>
+        <>
+          <div className="space-y-4 rounded-lg border border-border bg-card/40 p-4 lg:p-5">
+            <SourceVideoPlayer media={media} previewUrl={previewUrl} />
+            <Separator />
+            <SourceVideoDetails media={media} />
+          </div>
+          <ProcessingPanel project={project} media={media} />
+        </>
       ) : null}
 
       {isBusy ? (

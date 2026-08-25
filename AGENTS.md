@@ -40,5 +40,19 @@ Non-negotiables for new work:
 - Media validation runs before any project association changes, and a
   replacement keeps the old source until the new one commits.
 - Object URLs are ephemeral: revoke them, never persist them as identifiers.
+- FFmpeg/FFprobe live behind `MediaProcessor` in `src/server/processing/`.
+  No component, hook, API route or service may spawn processes, build command
+  strings, know binary paths or touch temp directories.
+- Server-side processing modules stay under `src/server/` (guarded by
+  `server-only`) and run on the Node runtime, never Edge.
+- The frontend talks to processing through `ProcessingClient` and the job
+  contract only; job ids, project ids and media ids are the currency, never
+  paths or process ids.
+- Temporary files are job-scoped and cleaned in a `finally`; backend paths and
+  raw FFmpeg output never reach the UI.
+- The multipart source upload is a development transport — production resolves
+  `sourceMediaId` from object storage. Keep the job model transport-agnostic.
+- Long-running media/AI work must stay movable to external workers: no queue
+  yet, but no assumptions that jobs run inside the web process either.
 - Run `npm run lint`, `npm run typecheck`, `npm test` and `npm run build` before
   calling work done.

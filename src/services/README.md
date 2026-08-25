@@ -8,9 +8,12 @@ live here:
    source-video lifecycle across the project repository and media storage, and
    `projects/delete-project.ts`, which disposes of a project's media when the
    project is deleted.
-2. **External processing clients** — the *only* place allowed to talk to
-   backend or external processing infrastructure. None exist yet;
-   `media/media-processing.ts` documents the contract they will implement.
+2. **Backend/processing clients** — the *only* place allowed to talk to
+   backend or external processing infrastructure. `processing/processing-client.ts`
+   is the first one: it speaks the processing job contract
+   (`/api/processing/*`) and knows nothing about FFmpeg.
+   `media/media-processing.ts` still documents the shape future AI job clients
+   will take.
 
 ## Why it exists
 
@@ -47,9 +50,11 @@ src/services/
 
 ## Status
 
-No external processing exists yet: no transcription, translation, speech
-synthesis, rendering or job APIs, and no mock stand-ins for them.
-`media/media-processing.ts` is a types-and-documentation boundary — it performs
-no I/O — describing how future jobs will reference stable `projectId` and
-`mediaId` values through a backend client. The first real processing client
-arrives with the first real workload.
+Media processing is real as of Part 4: `processing/processing-client.ts` creates,
+reads and cancels jobs served by `src/app/api/processing/*`, which run FFprobe
+inspection and canonical audio extraction through `src/server/processing/`.
+
+No AI processing exists yet: no transcription, diarization, source separation,
+translation, speech synthesis or rendering, and no mock stand-ins for them.
+Those stages will consume processing artifacts through this same job
+architecture — `media/media-processing.ts` sketches the client contract.
