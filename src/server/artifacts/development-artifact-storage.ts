@@ -6,6 +6,7 @@ import type { ProcessingArtifact } from "@/types/processing-artifact";
 import { ProcessingError } from "@/server/processing/processing-errors";
 import { defaultTempRoot } from "@/server/processing/temporary-file-manager";
 import type {
+  ArtifactQuery,
   ProcessingArtifactStorage,
   SaveArtifactInput,
 } from "@/server/artifacts/processing-artifact-storage";
@@ -80,6 +81,18 @@ export class DevelopmentArtifactStorage implements ProcessingArtifactStorage {
 
   async get(artifactId: string): Promise<ProcessingArtifact | null> {
     return this.artifacts.get(artifactId) ?? null;
+  }
+
+  async list(query: ArtifactQuery): Promise<ProcessingArtifact[]> {
+    return [...this.artifacts.values()]
+      .filter(
+        (artifact) =>
+          artifact.projectId === query.projectId &&
+          (query.sourceMediaId === undefined ||
+            artifact.sourceMediaId === query.sourceMediaId) &&
+          (query.type === undefined || artifact.type === query.type),
+      )
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
   }
 
   async read(artifactId: string): Promise<Uint8Array | null> {

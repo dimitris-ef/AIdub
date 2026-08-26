@@ -25,6 +25,10 @@ const baseJob: ProcessingJob = {
   completedAt: null,
   error: null,
   result: null,
+  stage: null,
+  providerId: null,
+  languageHint: null,
+  audioArtifactId: null,
 };
 
 describe("job status transitions", () => {

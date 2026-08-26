@@ -64,10 +64,16 @@ export function useSourceMedia(
   {
     service = projectMediaService,
     onProjectChanged,
+    preview = true,
   }: {
     service?: ProjectMediaService;
     /** Reloads the project so a changed `sourceMediaId` propagates. */
     onProjectChanged?: () => Promise<void> | void;
+    /**
+     * Loads the stored bytes and creates a preview URL. Sections that only
+     * need metadata (Transcript, for example) pass false and skip the read.
+     */
+    preview?: boolean;
   } = {},
 ): UseSourceMediaResult {
   const [resolution, setResolution] = useState<Resolution | null>(null);
@@ -78,22 +84,30 @@ export function useSourceMedia(
   const [actionError, setActionError] = useState<string | null>(null);
   const pendingRef = useRef<SourceMediaAction | null>(null);
 
+  const projectId = project?.id ?? null;
+  const sourceMediaId = project?.sourceMediaId ?? null;
   const key = resolutionKey(project, reloadToken);
 
+  // Deliberately keyed on the identity that decides the outcome (project id,
+  // source media id, reload token) rather than on the project object: a reload
+  // that returns an equivalent project must not revoke the object URL the
+  // player is currently showing.
   useEffect(() => {
-    if (!project) {
+    if (!projectId) {
       return;
     }
 
     let cancelled = false;
     let activeUrl: string | null = null;
 
-    async function resolve(current: Project): Promise<Omit<Resolution, "key">> {
-      if (!current.sourceMediaId) {
+    async function resolve(
+      currentProjectId: string,
+    ): Promise<Omit<Resolution, "key">> {
+      if (!sourceMediaId) {
         return { status: "empty", media: null, previewUrl: null, message: null };
       }
 
-      const media = await service.getSourceMedia(current.id);
+      const media = await service.getSourceMedia(currentProjectId);
 
       if (!media) {
         return {
@@ -102,6 +116,10 @@ export function useSourceMedia(
           previewUrl: null,
           message: null,
         };
+      }
+
+      if (!preview) {
+        return { status: "ready", media, previewUrl: null, message: null };
       }
 
       const blob = await service.getPlayableSource(media.id);
@@ -118,7 +136,7 @@ export function useSourceMedia(
       };
     }
 
-    resolve(project).then(
+    resolve(projectId).then(
       (result) => {
         if (cancelled) {
           // Nothing will render this URL; release it immediately.
@@ -150,7 +168,7 @@ export function useSourceMedia(
         URL.revokeObjectURL(activeUrl);
       }
     };
-  }, [project, key, service]);
+  }, [projectId, sourceMediaId, key, service, preview]);
 
   const runAction = useCallback(
     async (

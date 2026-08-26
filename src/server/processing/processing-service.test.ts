@@ -175,8 +175,23 @@ describe("ProcessingService", () => {
   describe("validation", () => {
     it("rejects an unsupported job type", async () => {
       await expect(
-        harness.service.createJob(request({ type: "transcribe" })),
+        harness.service.createJob(request({ type: "diarize" })),
       ).rejects.toMatchObject({ code: "UNSUPPORTED_JOB_TYPE" });
+    });
+
+    it("fails a transcribe job when no transcription runner is wired in", async () => {
+      const job = await harness.service.createJob(
+        request({ type: "transcribe" }),
+      );
+      const finished = await harness.service.runJob(job.id, {
+        bytes: sourceBytes,
+        filename: "clip.mp4",
+      });
+
+      expect(finished).toMatchObject({
+        status: "failed",
+        error: { code: "STT_PROVIDER_UNAVAILABLE" },
+      });
     });
 
     it("rejects unsafe or empty identifiers", async () => {

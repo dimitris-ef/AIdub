@@ -1,3 +1,4 @@
+import { writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { ProcessingArtifact } from "@/types/processing-artifact";
@@ -24,10 +25,37 @@ import type {
 } from "@/server/processing/processing-job-repository";
 import type { TemporaryFileManager } from "@/server/processing/temporary-file-manager";
 import type { ProcessingArtifactStorage } from "@/server/artifacts/processing-artifact-storage";
+import type { TranscriptRepository } from "@/data/transcripts";
 import type {
   ProcessingMediaSource,
   MaterializeSourceRequest,
 } from "@/server/processing/processing-media-source";
+
+/**
+ * The seam between media processing and any provider-driven stage that
+ * consumes generated audio — transcription today, later AI stages tomorrow.
+ * Keeping it an interface means this service never imports a provider, and the
+ * stage never learns how audio is produced.
+ */
+export interface StageRunContext {
+  job: ProcessingJob;
+  signal: AbortSignal;
+  /** Reuses the project's canonical audio, extracting it only if needed. */
+  ensureAudio: () => Promise<PreparedAudio>;
+  onProgress: (progress: number, stage?: string) => void;
+}
+
+export interface PreparedAudio {
+  artifact: ProcessingArtifact;
+  /** Local path inside the job workspace; cleaned up with the job. */
+  path: string;
+  mimeType: string;
+  durationSeconds: number | null;
+}
+
+export interface TranscriptionRunner {
+  run(context: StageRunContext): Promise<ProcessingJob["result"]>;
+}
 
 /**
  * Orchestrates the job lifecycle: validation, state transitions, temporary
@@ -48,6 +76,10 @@ export interface CreateJobRequest {
   projectId: string;
   sourceMediaId: string;
   type: string;
+  /** Chooses the provider for provider-driven job types. */
+  providerId?: string | null;
+  /** Optional source-language hint for providers that accept one. */
+  languageHint?: string | null;
   uploadedSource?: MaterializeSourceRequest["uploadedSource"];
 }
 
@@ -57,6 +89,10 @@ export interface ProcessingServiceOptions {
   temporaryFiles: TemporaryFileManager;
   artifacts: ProcessingArtifactStorage;
   mediaSource: ProcessingMediaSource;
+  /** Handles "transcribe" jobs; absent means transcription is unavailable. */
+  transcription?: TranscriptionRunner;
+  /** Lets project/media cleanup dispose of transcripts too. */
+  transcripts?: TranscriptRepository;
   logger?: (message: string, cause?: unknown) => void;
 }
 
@@ -70,6 +106,8 @@ export class ProcessingService {
   private readonly temporaryFiles: TemporaryFileManager;
   private readonly artifacts: ProcessingArtifactStorage;
   private readonly mediaSource: ProcessingMediaSource;
+  private readonly transcription?: TranscriptionRunner;
+  private readonly transcripts?: TranscriptRepository;
   private readonly logger: (message: string, cause?: unknown) => void;
   /** Live jobs, so they can be aborted. Never exposed to the frontend. */
   private readonly running = new Map<string, AbortController>();
@@ -80,6 +118,8 @@ export class ProcessingService {
     this.temporaryFiles = options.temporaryFiles;
     this.artifacts = options.artifacts;
     this.mediaSource = options.mediaSource;
+    this.transcription = options.transcription;
+    this.transcripts = options.transcripts;
     this.logger = options.logger ?? defaultLogger;
   }
 
@@ -98,6 +138,8 @@ export class ProcessingService {
       projectId: request.projectId,
       sourceMediaId: request.sourceMediaId,
       type,
+      providerId: request.providerId ?? null,
+      languageHint: request.languageHint ?? null,
     });
   }
 
@@ -121,6 +163,7 @@ export class ProcessingService {
         status: "processing",
         progress: PROGRESS_STARTED,
         indeterminate: job.type === "probe_media",
+        stage: job.type === "transcribe" ? "Preparing audio" : null,
       });
 
       const result = await this.execute(job, controller.signal, source);
@@ -223,9 +266,13 @@ export class ProcessingService {
 
     if (sourceMediaId) {
       await this.artifacts.deleteByMedia(sourceMediaId);
+      // A transcript describes one source version; when that source is gone
+      // the transcript goes with it rather than lingering as orphaned data.
+      await this.transcripts?.deleteByMedia(projectId, sourceMediaId);
     } else {
       await this.artifacts.deleteByProject(projectId);
       await this.repository.deleteByProject(projectId);
+      await this.transcripts?.deleteByProject(projectId);
     }
 
     return cancelled;
@@ -314,7 +361,96 @@ export class ProcessingService {
 
         return { kind: "convert_media", artifact: summarize(artifact) };
       }
+
+      case "transcribe": {
+        if (!this.transcription) {
+          throw new ProcessingError(
+            "STT_PROVIDER_UNAVAILABLE",
+            "Transcription is not available on this server.",
+          );
+        }
+
+        return this.transcription.run({
+          job,
+          signal,
+          ensureAudio: () => this.ensureCanonicalAudio(job, sourcePath, signal),
+          onProgress: (progress, stage) => {
+            void this.repository
+              .update(job.id, {
+                progress,
+                indeterminate: false,
+                ...(stage === undefined ? {} : { stage }),
+              })
+              .catch(() => {
+                // A dropped progress tick must never fail the job.
+              });
+          },
+        });
+      }
     }
+  }
+
+  /**
+   * Reuses the project's canonical audio when one exists for *this* source
+   * media and its bytes are still there, and extracts it otherwise. The audio
+   * is staged inside the job workspace, so it is cleaned up with the job while
+   * the artifact itself survives.
+   */
+  private async ensureCanonicalAudio(
+    job: ProcessingJob,
+    sourcePath: string,
+    signal: AbortSignal,
+  ): Promise<PreparedAudio> {
+    const existing = await this.artifacts.list({
+      projectId: job.projectId,
+      sourceMediaId: job.sourceMediaId,
+      type: "extracted_audio",
+    });
+
+    let artifact: ProcessingArtifact | null = null;
+    let bytes: Uint8Array | null = null;
+
+    for (const candidate of existing) {
+      const stored = await this.artifacts.read(candidate.id);
+
+      // Metadata without bytes is not reusable; fall through and regenerate.
+      if (stored && stored.byteLength > 0) {
+        artifact = candidate;
+        bytes = stored;
+        break;
+      }
+    }
+
+    if (!artifact || !bytes) {
+      artifact = await this.produceAudio(job, sourcePath, signal);
+      bytes = await this.artifacts.read(artifact.id);
+
+      if (!bytes) {
+        throw new ProcessingError(
+          "AUDIO_ARTIFACT_MISSING",
+          "Transcription could not start because the source audio is unavailable.",
+        );
+      }
+    }
+
+    await this.repository
+      .update(job.id, { audioArtifactId: artifact.id })
+      .catch(() => {
+        // Recording the artifact reference is best effort.
+      });
+
+    const audioPath = await this.temporaryFiles.createPath(
+      job.id,
+      `stage-audio.${CANONICAL_AUDIO.extension}`,
+    );
+    await writeFile(audioPath, bytes);
+
+    return {
+      artifact,
+      path: audioPath,
+      mimeType: artifact.mimeType,
+      durationSeconds: artifact.durationSeconds,
+    };
   }
 
   private async produceAudio(

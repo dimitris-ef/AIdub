@@ -21,14 +21,20 @@ export interface CreateProcessingJobInput {
   projectId: string;
   sourceMediaId: string;
   type: ProcessingJobType;
+  /** Set for jobs that run through a pluggable provider. */
+  providerId?: string | null;
+  /** Optional source-language hint passed to the provider. */
+  languageHint?: string | null;
 }
 
 export interface UpdateProcessingJobInput {
   status?: ProcessingJobStatus;
   progress?: number;
   indeterminate?: boolean;
+  stage?: string | null;
   error?: ProcessingJobError | null;
   result?: ProcessingJobResult;
+  audioArtifactId?: string | null;
 }
 
 export interface ProcessingJobRepository {
@@ -125,6 +131,11 @@ export function applyJobUpdate(
     status,
     progress: normalizeProgress(status, input.progress, job.progress),
     indeterminate: input.indeterminate ?? job.indeterminate,
+    stage: input.stage === undefined ? job.stage : input.stage,
+    audioArtifactId:
+      input.audioArtifactId === undefined
+        ? job.audioArtifactId
+        : input.audioArtifactId,
     error: input.error === undefined ? job.error : input.error,
     result: input.result === undefined ? job.result : input.result,
     startedAt:

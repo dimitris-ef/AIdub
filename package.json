@@ -9,7 +9,8 @@
     "lint": "eslint",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "setup:stt": "node scripts/download-stt-models.mjs"
   },
   "dependencies": {
     "@radix-ui/react-alert-dialog": "^1.1.23",
@@ -40,6 +41,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.3.2",
     "fake-indexeddb": "^6.2.5",
+    "sherpa-onnx-node": "^1.13.6",
     "tailwindcss": "^4",
     "tw-animate-css": "^1.4.0",
     "typescript": "^5",

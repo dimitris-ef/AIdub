@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local STT models (downloaded via npm run setup:stt)
+/.aidub

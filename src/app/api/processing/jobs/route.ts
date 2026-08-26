@@ -40,6 +40,8 @@ export async function POST(request: NextRequest) {
   const projectId = readRequiredParam(form.get("projectId"));
   const sourceMediaId = readRequiredParam(form.get("sourceMediaId"));
   const type = readRequiredParam(form.get("type"));
+  const providerId = readRequiredParam(form.get("providerId"));
+  const languageHint = readRequiredParam(form.get("language"));
   const source = form.get("source");
 
   if (!projectId || !sourceMediaId || !type) {
@@ -72,6 +74,8 @@ export async function POST(request: NextRequest) {
       projectId,
       sourceMediaId,
       type,
+      providerId,
+      languageHint,
       uploadedSource: { bytes, filename: source.name },
     });
 

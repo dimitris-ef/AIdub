@@ -11,6 +11,7 @@ export const PROCESSING_JOB_TYPES = [
   "probe_media",
   "extract_audio",
   "convert_media",
+  "transcribe",
 ] as const;
 
 export type ProcessingJobType = (typeof PROCESSING_JOB_TYPES)[number];
@@ -41,6 +42,16 @@ export const PROCESSING_ERROR_CODES = [
   "UNSUPPORTED_JOB_TYPE",
   "PROBE_FAILED",
   "NO_AUDIO_STREAM",
+  "STT_PROVIDER_UNAVAILABLE",
+  "STT_AUTHENTICATION_FAILED",
+  "STT_REQUEST_FAILED",
+  "STT_TIMEOUT",
+  "STT_INVALID_RESPONSE",
+  "STT_TIMESTAMP_INVALID",
+  "STT_UNSUPPORTED_AUDIO",
+  "AUDIO_ARTIFACT_MISSING",
+  "TRANSCRIPT_SAVE_FAILED",
+  "TRANSCRIPTION_CANCELLED",
   "AUDIO_EXTRACTION_FAILED",
   "CONVERSION_FAILED",
   "TEMP_STORAGE_ERROR",
@@ -94,10 +105,24 @@ export interface ConvertMediaJobResult {
   artifact: ExtractedAudioSummary;
 }
 
+/**
+ * Transcription references the saved transcript rather than repeating it:
+ * the transcript is persisted in its own store and outlives the job.
+ */
+export interface TranscribeJobResult {
+  kind: "transcribe";
+  transcriptId: string;
+  segmentCount: number;
+  detectedLanguage: string | null;
+  providerId: string;
+  providerModel: string | null;
+}
+
 export type ProcessingJobResult =
   | ProbeJobResult
   | ExtractAudioJobResult
   | ConvertMediaJobResult
+  | TranscribeJobResult
   | null;
 
 export interface ProcessingJob {
@@ -110,12 +135,20 @@ export interface ProcessingJob {
   progress: number;
   /** True while the backend cannot compute a real percentage. */
   indeterminate: boolean;
+  /** Coarse phase label, e.g. "Recognising speech"; null when not reported. */
+  stage: string | null;
   createdAt: string;
   updatedAt: string;
   startedAt: string | null;
   completedAt: string | null;
   error: ProcessingJobError | null;
   result: ProcessingJobResult;
+  /** Set by jobs that use a pluggable provider (transcription today). */
+  providerId: string | null;
+  /** Optional source-language hint for providers that accept one. */
+  languageHint: string | null;
+  /** The generated audio a job consumed, once it is known. */
+  audioArtifactId: string | null;
 }
 
 /**

@@ -54,7 +54,11 @@ Media processing is real as of Part 4: `processing/processing-client.ts` creates
 reads and cancels jobs served by `src/app/api/processing/*`, which run FFprobe
 inspection and canonical audio extraction through `src/server/processing/`.
 
-No AI processing exists yet: no transcription, diarization, source separation,
-translation, speech synthesis or rendering, and no mock stand-ins for them.
-Those stages will consume processing artifacts through this same job
-architecture — `media/media-processing.ts` sketches the client contract.
+Speech-to-text is real as of Part 5: the same processing client creates
+`transcribe` jobs, and `transcription/transcript-client.ts` reads the stored
+transcript back. Providers, credentials and model runtimes stay in
+`src/server/transcription/`.
+
+Still absent: diarization, source separation, translation, speech synthesis and
+rendering — with no mock stand-ins. Those stages consume transcripts and
+processing artifacts through this same job architecture.

@@ -20,7 +20,11 @@ export function SourceVideoPlayer({
   /** Ephemeral object URL created by the media layer. */
   previewUrl: string;
 }) {
-  const [failed, setFailed] = useState(false);
+  // Track *which* source failed rather than a sticky boolean: a replacement (or
+  // a re-created object URL for the same media) must get a fresh chance to play
+  // instead of inheriting the previous source's failure.
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+  const failed = failedUrl === previewUrl;
 
   // Reserve the real aspect ratio up front so the layout does not jump once
   // metadata loads.
@@ -55,7 +59,7 @@ export function SourceVideoPlayer({
       className="w-full max-w-full rounded-lg border border-border bg-black"
       style={{ aspectRatio }}
       aria-label={`Source video preview: ${media.filename}`}
-      onError={() => setFailed(true)}
+      onError={() => setFailedUrl(previewUrl)}
     >
       Your browser cannot play this video.
     </video>

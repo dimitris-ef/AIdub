@@ -6,6 +6,8 @@ import { FfmpegMediaProcessor } from "@/server/processing/ffmpeg-media-processor
 import { UploadedProcessingMediaSource } from "@/server/processing/processing-media-source";
 import { ProcessingService } from "@/server/processing/processing-service";
 import { LocalTemporaryFileManager } from "@/server/processing/temporary-file-manager";
+import { TranscriptionService } from "@/server/transcription/transcription-service";
+import { transcriptRepository } from "@/data/transcripts";
 
 /**
  * Server-side wiring. `server-only` keeps this module — and everything it
@@ -30,6 +32,8 @@ function createProcessingService(): ProcessingService {
     temporaryFiles: new LocalTemporaryFileManager(),
     artifacts: new DevelopmentArtifactStorage(),
     mediaSource: new UploadedProcessingMediaSource(),
+    transcription: new TranscriptionService(),
+    transcripts: transcriptRepository,
   });
 }
 

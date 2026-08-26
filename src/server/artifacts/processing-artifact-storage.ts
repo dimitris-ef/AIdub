@@ -24,9 +24,17 @@ export interface SaveArtifactInput {
   durationSeconds?: number | null;
 }
 
+export interface ArtifactQuery {
+  projectId: string;
+  sourceMediaId?: string;
+  type?: ProcessingArtifactType;
+}
+
 export interface ProcessingArtifactStorage {
   save(input: SaveArtifactInput): Promise<ProcessingArtifact>;
   get(artifactId: string): Promise<ProcessingArtifact | null>;
+  /** Artifacts matching a scope, newest first. */
+  list(query: ArtifactQuery): Promise<ProcessingArtifact[]>;
   /** Bytes for download; null when the artifact is gone. */
   read(artifactId: string): Promise<Uint8Array | null>;
   delete(artifactId: string): Promise<void>;

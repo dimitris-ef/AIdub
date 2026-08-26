@@ -18,6 +18,10 @@ export interface CreateProcessingJobRequest {
   projectId: string;
   sourceMediaId: string;
   type: ProcessingJobType;
+  /** Provider for provider-driven job types; the server default otherwise. */
+  providerId?: string;
+  /** Source-language hint for providers that accept one. */
+  language?: string | null;
   /**
    * Development transport: the browser holds the source bytes (Part 3), so it
    * hands them to the backend with the request. Production drops this and lets
@@ -86,6 +90,10 @@ export function parseProcessingJob(value: unknown): ProcessingJob {
   return {
     ...(job as ProcessingJob),
     indeterminate: Boolean(job.indeterminate),
+    stage: job.stage ?? null,
+    providerId: job.providerId ?? null,
+    languageHint: job.languageHint ?? null,
+    audioArtifactId: job.audioArtifactId ?? null,
     startedAt: job.startedAt ?? null,
     completedAt: job.completedAt ?? null,
     error: job.error ?? null,
@@ -118,6 +126,8 @@ export class HttpProcessingClient implements ProcessingClient {
     projectId,
     sourceMediaId,
     type,
+    providerId,
+    language,
     source,
     sourceFilename,
     signal,
@@ -127,6 +137,13 @@ export class HttpProcessingClient implements ProcessingClient {
     form.set("sourceMediaId", sourceMediaId);
     form.set("type", type);
     form.set("source", source, sourceFilename);
+
+    if (providerId) {
+      form.set("providerId", providerId);
+    }
+    if (language) {
+      form.set("language", language);
+    }
 
     const response = await fetch(`${this.baseUrl}/jobs`, {
       method: "POST",

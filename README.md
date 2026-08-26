@@ -12,11 +12,12 @@ contains:
   inspecting, previewing, replacing and removing a project's source video.
 - **Part 4: Backend Media-Processing Foundation** — a server-side processing
   job pipeline (FFprobe inspection and canonical audio extraction) that later
-  AI stages will run through.
+  AI stages run through.
+- **Part 5: Speech-to-Text System** — provider-agnostic transcription that
+  turns the source speech into persisted, timestamped segments.
 
-There is still **no** dubbing functionality: no transcription, diarization,
-translation, voices, mixing or export. Those build on this foundation in later
-parts.
+There is still **no** dubbing functionality: no diarization, translation,
+voices, mixing or export. Those build on this foundation in later parts.
 
 ## Stack
 
@@ -29,6 +30,7 @@ parts.
 | Toasts      | sonner                                       |
 | Tests       | Vitest                                       |
 | Media tools | FFmpeg + FFprobe, behind a backend adapter   |
+| Speech      | Local Whisper (sherpa-onnx) or any OpenAI-compatible STT API, behind a provider adapter |
 | Hosting     | Vercel                                       |
 
 ## Local development
@@ -50,6 +52,28 @@ npm start          # serve a production build locally
 ```
 
 Localhost is a development environment only — it is not the deployment story.
+
+### Speech models for local transcription
+
+The default transcription provider runs a Whisper model on this machine. The
+runtime (`sherpa-onnx-node`) installs with `npm install`; the model files are
+downloaded separately and never committed:
+
+```bash
+npm run setup:stt   # ~100 MB into .aidub/stt-models (gitignored)
+```
+
+Without them the app still runs: the provider reports itself unavailable and
+the Transcript workspace says so instead of failing mid-job. Configuration:
+
+| Variable | Purpose |
+| --- | --- |
+| `AIDUB_STT_PROVIDER` | `local-whisper` (default), `openai-compatible`, or `mock` |
+| `AIDUB_STT_MODEL_DIR` | Where the local model files live (default `.aidub/stt-models`) |
+| `AIDUB_STT_MODEL` | Model label recorded on transcripts |
+| `AIDUB_STT_API_KEY` | Credential for the remote provider — server-side only |
+| `AIDUB_STT_BASE_URL` | Remote endpoint (default `https://api.openai.com/v1`) |
+| `AIDUB_STT_TIMEOUT_MS` | Provider timeout (default 15 minutes) |
 
 ### FFmpeg for local processing
 
@@ -88,7 +112,7 @@ Vercel web layer, behind the service boundaries described below.
 | `/projects`                          | Projects dashboard: create, open, rename, delete          |
 | `/projects/[projectId]`              | Redirects to the workspace's default section (`media`)    |
 | `/projects/[projectId]/media`        | Media section — source video import, preview, replace     |
-| `/projects/[projectId]/transcript`   | Transcript section (placeholder)                          |
+| `/projects/[projectId]/transcript`   | Transcript section — transcribe, review timestamped text  |
 | `/projects/[projectId]/translate`    | Translate section (placeholder)                           |
 | `/projects/[projectId]/voices`       | Voices section (placeholder)                              |
 | `/projects/[projectId]/mix`          | Mix section (placeholder)                                 |
@@ -106,6 +130,7 @@ Processing API (Node runtime, see Part 4):
 | `POST /api/processing/jobs/[jobId]/cancel`  | Cancel a queued or running job               |
 | `GET /api/processing/artifacts/[artifactId]`| Download a generated artifact                |
 | `GET /api/processing/capabilities`          | Whether FFmpeg/FFprobe are available         |
+| `GET /api/transcripts`                      | The stored transcript for a project + source |
 
 Workspace routes load the project identified by `[projectId]`. An id that does
 not exist in this browser renders a "Project not found" state with a route back
@@ -137,7 +162,10 @@ src/
 ├── data/projects/           # ProjectRepository contract + browser-local implementation
 ├── data/media/              # MediaStorage contract + IndexedDB implementation
 ├── server/processing/       # job service, MediaProcessor, FFmpeg adapter, temp files
+├── server/transcription/    # transcription service, STT provider contract + adapters
 ├── server/artifacts/        # generated-artifact storage
+├── data/transcripts/        # TranscriptRepository + development store
+├── components/transcript/   # transcript workspace, segment rows, status
 ├── app/api/processing/      # processing job + artifact routes (Node runtime)
 ├── components/processing/   # job panel, status badge, progress, results
 ├── services/                # application services + processing client
@@ -719,15 +747,220 @@ they are. Nothing in the web build depends on FFmpeg being present: the
 binaries are resolved at runtime, and a deployment without them simply reports
 processing as unavailable.
 
+## Part 5: Speech-to-Text System
+
+Part 5 answers one question — **what was said, and when** — and stores the
+answer. It does not say *who* said it: diarization is a later part, and there
+are no speaker fields in the model.
+
+```text
+Transcript workspace
+  → ProcessingClient ("transcribe" job)   the UI's only backend contact
+    → ProcessingService                    job lifecycle, temp workspace
+      → TranscriptionService               orchestration, normalisation
+        → SpeechToTextProvider             local model, remote API, worker…
+          → normalised result
+        → TranscriptRepository             persisted transcript
+```
+
+The workspace never learns which model ran, where it ran, or what the provider's
+JSON looked like.
+
+### Provider abstraction
+
+`SpeechToTextProvider` (`src/server/transcription/speech-to-text-provider.ts`)
+takes audio (a path or bytes) plus an optional language hint and returns
+normalised segments, with a `capabilities` block describing what it can
+actually do (language hints, segment/word timestamps, real confidence). It is
+deliberately not HTTP-shaped, so a local model, a self-hosted server and a
+remote API all fit — and a GPU worker later fits the same way. Providers are
+registered in one place
+(`speech-to-text-provider-registry.ts`); the default comes from
+`AIDUB_STT_PROVIDER`, so a future Settings page can choose one without touching
+transcription code.
+
+### Providers implemented
+
+- **`local-whisper` (default)** — fully local and self-hosted. Silero VAD splits
+  the canonical 16 kHz mono WAV into speech regions and a Whisper model
+  (`whisper-tiny.en` by default, via `sherpa-onnx-node`) transcribes each one,
+  so segment times come from the audio itself. No credentials, no network, no
+  data leaving the machine. Requires `npm run setup:stt`; without the model
+  files it reports itself unavailable. Limitations: an English tiny model by
+  default, CPU-bound, and no language hint or calibrated confidence — Whisper's
+  token log probabilities are kept as provider metadata instead of being
+  reshaped into a confidence score.
+- **`openai-compatible`** — the widely implemented
+  `POST /audio/transcriptions` shape (OpenAI's endpoint and the self-hosted
+  servers that copy it). Credentials come from `AIDUB_STT_API_KEY` on the
+  server only: they are never bundled, never sent to the browser, never stored
+  in a transcript and never logged.
+- **`mock`** — deterministic, for tests and offline development. It is only
+  registered when `AIDUB_STT_PROVIDER=mock` is set explicitly, so it can never
+  become a silent production default.
+
+### Transcript model
+
+`src/types/transcript.ts`:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `id` | `string` | stable transcript id |
+| `projectId` | `string` | owning project |
+| `sourceMediaId` | `string` | the exact source version transcribed |
+| `audioArtifactId` | `string \| null` | the Part 4 audio artifact used |
+| `providerId` / `providerModel` | `string` / `string \| null` | which provider and model produced it |
+| `language` | `string \| null` | detected/confirmed language; never written back to the project |
+| `status` | `processing \| completed \| failed` | see below |
+| `segments` | `TranscriptSegment[]` | timeline-ordered |
+| `createdAt` / `updatedAt` | `string` | ISO 8601 |
+
+### Segment model
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `id` | `string` | stable; speakers, translations and generated audio will hang off it |
+| `startTime` / `endTime` | `number` | **seconds**, the canonical unit everywhere |
+| `originalText` | `string` | the original-language transcription; translation must never overwrite it |
+| `status` | `completed \| low_confidence` | |
+| `confidence` | `number \| null` | normalised 0–1, or null — never invented |
+| `providerMetadata` | `Record<string, unknown>` | model name, average log probability, no-speech probability… never raw dumps, never secrets |
+
+Timestamps are stored as numbers and formatted only for display
+(`00:03.240`, `1:02:14.820`).
+
+### Transcript status vs job status
+
+`ProcessingJob.status` owns execution (`queued → processing → completed |
+failed | cancelled`); `Transcript.status` describes the stored artefact and is
+`completed` for everything that gets persisted. A transcript is only written
+once its segments have been normalised and validated, so a failed or cancelled
+job leaves no transcript at all. The project's own status stays as Part 3
+defined it (`draft`/`ready`) — a failed transcription never marks the project
+itself as errored.
+
+### Normalisation and validation
+
+Provider output goes through one pure step
+(`src/lib/transcript/normalize-transcript.ts`) before anything is stored:
+
+- text is trimmed but otherwise left exactly as the provider wrote it —
+  capitalisation, punctuation and wording are never rewritten;
+- blank and whitespace-only segments are dropped; timestamps are never moved to
+  close the gaps they leave;
+- every segment must have finite timestamps with `startTime >= 0` and
+  `endTime >= startTime`; violations fail the job with
+  `STT_TIMESTAMP_INVALID` rather than entering the transcript;
+- sub-50 ms negative starts and sub-second overshoot past the media duration
+  are treated as rounding and clamped; anything larger is rejected;
+- segments are sorted by start time. **Overlaps are allowed** — recognisers
+  legitimately produce them and the timeline will handle them explicitly;
+- confidence is kept only when it is already comparable on a 0–1 scale;
+  anything else becomes `null` and stays in provider metadata;
+- stable ids are generated per segment — never array positions.
+
+Zero segments from a provider that clearly heard nothing is a **valid empty
+transcript**, and the workspace says "No speech was detected in this source."
+That is distinct from a malformed response, which fails with
+`STT_INVALID_RESPONSE`.
+
+### Audio dependency
+
+Transcription consumes Part 4's canonical audio artifact (WAV, mono, 16 kHz,
+PCM s16le) and never runs FFmpeg itself. When the user starts transcription the
+processing layer looks for an existing `extracted_audio` artifact for **this**
+project and **this** source media whose bytes are still present; it reuses that
+one, and only extracts when there is none (or the bytes are gone). The user
+never has to press "Extract audio" first, and the same audio is not extracted
+twice.
+
+### Job integration and progress
+
+Transcription is a `transcribe` processing job — the same model, API and status
+UI as Part 4, not a second AI-job system. Jobs carry `projectId`,
+`sourceMediaId`, the `providerId` used, and the `audioArtifactId` once known,
+and the result references the saved transcript rather than repeating it:
+
+```ts
+{ kind: "transcribe", transcriptId, segmentCount, detectedLanguage, providerId, providerModel }
+```
+
+Progress maps to one documented scale: 1–10 preparing, 10–30 extracting audio
+when needed, 30–90 provider work (real percentages when the provider reports
+them), 95 saving, 100 done, with a stage label such as "Recognising speech".
+
+### Persistence
+
+Transcripts are stored server-side as JSON under
+`<os temp>/aidub/transcripts/v1/<projectId>/<transcriptId>.json`, behind
+`TranscriptRepository`. The server owns this store because it is the only place
+that can guarantee a transcript is written *after* validation succeeds. The
+`v1` path segment is the schema version: adding speakers, translations, edits or
+word timestamps later means writing `v2` and migrating on read, not discarding
+existing transcripts.
+
+This is development persistence — local to one machine and subject to temp
+reclamation. Production replaces it with a database behind the same interface;
+the workspace, which reads through `TranscriptClient`, does not change.
+
+### Source association
+
+A transcript belongs to one project **and** one exact `sourceMediaId`. Replacing
+the source video creates a new media identity, so the old transcript stays
+attached to the old source and the new one starts with "No transcript yet" —
+old text is never silently carried over. Removing the source, or deleting the
+project, disposes of the associated transcripts through the same cleanup path
+that handles media and artifacts. Renaming a project changes nothing about
+transcripts.
+
+### Reuse, retranscription, cancellation and errors
+
+Opening the workspace loads the stored transcript for the current source and
+never starts work on its own. Retranscription is explicit: the new transcript is
+saved first and only then does the previous one go. Cancelling stops the
+provider, leaves the job `cancelled`, and saves nothing — a result that arrives
+after cancellation is discarded. Failures are normalised
+(`STT_PROVIDER_UNAVAILABLE`, `STT_AUTHENTICATION_FAILED`, `STT_REQUEST_FAILED`,
+`STT_TIMEOUT`, `STT_INVALID_RESPONSE`, `STT_TIMESTAMP_INVALID`,
+`STT_UNSUPPORTED_AUDIO`, `AUDIO_ARTIFACT_MISSING`, `AUDIO_EXTRACTION_FAILED`,
+`TRANSCRIPT_SAVE_FAILED`) and shown as one short sentence, with retry available;
+technical detail stays in server logs, which record ids, provider, model,
+segment counts and durations — never audio, transcripts or credentials.
+
+### Production architecture
+
+```text
+Browser (Vercel-hosted Aidub)
+  → processing/job API
+    → queue / job coordinator
+      → transcription worker (CPU or GPU)
+        → SpeechToTextProvider (local model or external API)
+          → transcript persistence (database)
+```
+
+Long transcriptions are **not** intended to run inside Vercel functions. Moving
+execution out means running `TranscriptionService` in the worker and swapping
+the job repository, artifact storage and transcript repository for production
+implementations — `ProcessingJob`, `Transcript`, the HTTP contract and the
+Transcript workspace all stay as they are.
+
+### Explicit non-goals
+
+Part 5 does **no** diarization (no speakers, embeddings or voice identity), no
+translation or LLM calls, no source separation, no TTS or voice cloning, and no
+dubbing or mixing. The extracted audio is not sent to any AI provider beyond
+the configured speech-to-text one.
+
 ## Not implemented (on purpose)
 
 Authentication, accounts, billing, a production database, cloud media storage,
 transcoding for delivery, proxy or thumbnail generation, waveform generation,
 real queues and external workers, transcription, diarization, source separation,
-translation, LLM integration, TTS, voice cloning, the persistent workspace
+LLM/translation integration, TTS, voice cloning, the persistent workspace
 player, the dubbing timeline, export/render processing, analytics and
-collaboration are all still out of scope. Part 4 stops at media processing and
-artifact production: the extracted audio is not sent to any AI provider. There are no placeholder or mock API
+collaboration are all still out of scope. Part 5 stops at speech-to-text:
+transcript text is stored, and nothing is translated, attributed to a speaker,
+synthesised or mixed. There are no placeholder or mock API
 routes for them; the app ships with no `app/api` directory at all. Project and
 media persistence exist only in the temporary browser-local forms described
 above.
@@ -816,3 +1049,29 @@ Part 4 adds:
     media they processed.
 42. Future transcription and AI stages consume processing artifacts through
     this same job architecture.
+
+Part 5 adds:
+
+43. Speech-to-text providers stay behind `SpeechToTextProvider`, and the
+    Transcript UI stays provider-agnostic.
+44. Provider response shapes never become the core transcript model; vendor
+    extras live in `providerMetadata`.
+45. Transcription runs as a `transcribe` processing job — never a second,
+    parallel AI-job system.
+46. Every transcript belongs to a project **and** an exact `sourceMediaId`, and
+    references the audio artifact it was made from.
+47. Transcript segments have **stable ids** and timestamps in **numeric
+    seconds**.
+48. `originalText` is the original-language transcription and must never be
+    overwritten by a translation.
+49. Speaker information is not part of speech-to-text; diarization refines
+    these existing segments later.
+50. Confidence is optional and never fabricated.
+51. Completed transcripts persist independently of jobs; reopening a project
+    reuses the stored transcript instead of transcribing again.
+52. Replacing source media never reuses the old source's transcript.
+53. Local/self-hosted models and external APIs must both be addable without
+    changing the transcript domain model or the UI.
+54. Provider secrets stay server/worker-side.
+55. Long-running transcription is never permanently tied to Vercel functions.
+56. Future translation references stable transcript segment ids.

@@ -54,5 +54,18 @@ Non-negotiables for new work:
   `sourceMediaId` from object storage. Keep the job model transport-agnostic.
 - Long-running media/AI work must stay movable to external workers: no queue
   yet, but no assumptions that jobs run inside the web process either.
+- Speech-to-text lives behind `SpeechToTextProvider` in
+  `src/server/transcription/`; provider JSON, credentials and model runtimes
+  never leak into the transcript model or any component.
+- Transcription is a `transcribe` processing job — never a second AI-job
+  system — and consumes Part 4's canonical audio artifact instead of running
+  FFmpeg itself.
+- A transcript belongs to one project and one exact `sourceMediaId`; segment
+  ids are stable, times are numeric seconds, and `originalText` must never be
+  overwritten by a translation.
+- No speaker/diarization data in Part 5 segments; later parts refine these
+  segments rather than replacing them.
+- Never fabricate confidence: unusable provider values become `null` and stay
+  in `providerMetadata`.
 - Run `npm run lint`, `npm run typecheck`, `npm test` and `npm run build` before
   calling work done.

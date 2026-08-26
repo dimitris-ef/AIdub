@@ -54,12 +54,16 @@ export class InMemoryProcessingJobRepository
       status: "queued",
       progress: PROGRESS_QUEUED,
       indeterminate: false,
+      stage: null,
       createdAt: timestamp,
       updatedAt: timestamp,
       startedAt: null,
       completedAt: null,
       error: null,
       result: null,
+      providerId: input.providerId ?? null,
+      languageHint: input.languageHint ?? null,
+      audioArtifactId: null,
     };
 
     this.jobs.set(job.id, job);

@@ -25,6 +25,16 @@ export function ProcessingJobResultDetails({
     return <ProbeDetails metadata={result.metadata} />;
   }
 
+  if (result.kind === "transcribe") {
+    return (
+      <p className="text-xs text-muted-foreground">
+        {result.segmentCount === 0
+          ? "No speech was detected in this source."
+          : `${result.segmentCount} transcript ${result.segmentCount === 1 ? "segment" : "segments"} · ${result.providerModel ?? result.providerId}`}
+      </p>
+    );
+  }
+
   const { artifact } = result;
   const parts = [
     "WAV",
