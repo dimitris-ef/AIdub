@@ -1,19 +1,11 @@
 "use client";
 
-import { X } from "lucide-react";
-
 import type { ProcessingJob } from "@/types/processing-job";
-import { describeJobProgress, isJobCancellable } from "@/lib/processing";
-import { Button } from "@/components/ui/button";
-import {
-  ProcessingErrorMessage,
-  ProcessingJobStatusBadge,
-  ProcessingProgress,
-} from "@/components/processing/processing-job-status";
+import { StageJobStatus } from "@/components/processing/stage-job-status";
 
 /**
- * Live state of a transcription job, built from the Part 4 job model and its
- * status components — transcription does not get its own job UI system.
+ * Live state of a transcription job. The job UI itself is shared with every
+ * other provider-driven stage — transcription does not get its own system.
  */
 export function TranscriptionStatus({
   job,
@@ -22,47 +14,11 @@ export function TranscriptionStatus({
   job: ProcessingJob;
   onCancel: () => void;
 }) {
-  const active = job.status === "queued" || job.status === "processing";
-
   return (
-    <div className="space-y-2 rounded-lg border border-border bg-card/40 p-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-medium">Transcribing source audio</span>
-          <ProcessingJobStatusBadge status={job.status} />
-        </div>
-
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-muted-foreground">
-            {describeJobProgress(job)}
-          </span>
-          {isJobCancellable(job) ? (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7 px-2 text-xs"
-              onClick={onCancel}
-            >
-              <X aria-hidden />
-              Cancel
-            </Button>
-          ) : null}
-        </div>
-      </div>
-
-      {active ? (
-        <>
-          <ProcessingProgress
-            progress={job.progress}
-            indeterminate={job.indeterminate}
-          />
-          {job.stage ? (
-            <p className="text-xs text-muted-foreground">{job.stage}…</p>
-          ) : null}
-        </>
-      ) : null}
-
-      {job.error ? <ProcessingErrorMessage message={job.error.message} /> : null}
-    </div>
+    <StageJobStatus
+      job={job}
+      title="Transcribing source audio"
+      onCancel={onCancel}
+    />
   );
 }

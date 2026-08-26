@@ -10,7 +10,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "setup:stt": "node scripts/download-stt-models.mjs"
+    "setup:stt": "node scripts/download-stt-models.mjs",
+    "setup:diarization": "node scripts/download-diarization-models.mjs"
   },
   "dependencies": {
     "@radix-ui/react-alert-dialog": "^1.1.23",

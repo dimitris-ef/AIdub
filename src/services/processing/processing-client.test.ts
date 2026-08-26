@@ -70,7 +70,7 @@ describe("parseProcessingJob", () => {
   it.each([
     ["null", null],
     ["a missing id", { ...job, id: undefined }],
-    ["an unknown type", { ...job, type: "diarize" }],
+    ["an unknown type", { ...job, type: "translate" }],
     ["an unknown status", { ...job, status: "paused" }],
     ["a non-numeric progress", { ...job, progress: "42" }],
   ])("rejects %s", (_label, value) => {

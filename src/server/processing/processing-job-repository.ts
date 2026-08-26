@@ -35,6 +35,8 @@ export interface UpdateProcessingJobInput {
   error?: ProcessingJobError | null;
   result?: ProcessingJobResult;
   audioArtifactId?: string | null;
+  /** Recorded once a provider-driven stage has resolved its provider. */
+  providerId?: string | null;
 }
 
 export interface ProcessingJobRepository {
@@ -136,6 +138,8 @@ export function applyJobUpdate(
       input.audioArtifactId === undefined
         ? job.audioArtifactId
         : input.audioArtifactId,
+    providerId:
+      input.providerId === undefined ? job.providerId : input.providerId,
     error: input.error === undefined ? job.error : input.error,
     result: input.result === undefined ? job.result : input.result,
     startedAt:

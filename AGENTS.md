@@ -63,8 +63,26 @@ Non-negotiables for new work:
 - A transcript belongs to one project and one exact `sourceMediaId`; segment
   ids are stable, times are numeric seconds, and `originalText` must never be
   overwritten by a translation.
-- No speaker/diarization data in Part 5 segments; later parts refine these
-  segments rather than replacing them.
+- Speaker diarization lives behind `SpeakerDiarizationProvider` in
+  `src/server/diarization/` — a separate abstraction from
+  `SpeechToTextProvider`. Never merge the two: Aidub must stay able to pair any
+  STT provider with any diarization provider.
+- Diarization is a `diarize` processing job and consumes Part 4's canonical
+  audio artifact; it never runs its own extraction.
+- Blocking native model calls run on a worker thread, never on the request
+  thread, and a cancelled run is detached rather than terminated — killing a
+  worker mid-call aborts the whole process.
+- Provider speaker labels are normalised before persistence. Canonical ids are
+  `speaker_1`, `speaker_2`, … assigned by first appearance on the timeline;
+  raw labels survive only in `providerMetadata`. Speaker ids are anonymous
+  clusters, never a claim about a real person.
+- A diarization belongs to one project and one exact `sourceMediaId`; speaker
+  and region ids are stable within a result and are read back, never
+  regenerated on load.
+- Speaker regions use numeric seconds, stay in timeline order, keep overlap,
+  and leave silence as a gap — never a placeholder speaker.
+- Part 6 must not modify transcript segments. Merging the transcript and
+  speaker timelines is Part 7's job, working on normalised ids and timestamps.
 - Never fabricate confidence: unusable provider values become `null` and stay
   in `providerMetadata`.
 - Run `npm run lint`, `npm run typecheck`, `npm test` and `npm run build` before

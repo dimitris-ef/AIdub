@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ProcessingErrorMessage } from "@/components/processing/processing-job-status";
+import { SpeakerAnalysisPanel } from "@/components/diarization/speaker-analysis-panel";
 import { TranscriptMessage } from "@/components/transcript/transcript-empty-state";
 import { TranscriptSegmentRow } from "@/components/transcript/transcript-segment-row";
 import { TranscriptionStatus } from "@/components/transcript/transcription-status";
@@ -26,8 +27,12 @@ import { TranscriptionStatus } from "@/components/transcript/transcription-statu
  *
  * It knows nothing about speech models, providers or credentials — it starts a
  * `transcribe` processing job and reads the persisted transcript back through
- * `TranscriptClient`. No speaker information is shown or stored: diarization
- * is a later part.
+ * `TranscriptClient`.
+ *
+ * Speaker Analysis (Part 6) shares this section because speaker work is part
+ * of preparing a transcript, but the two remain independent: transcript rows
+ * carry no speaker information, and the diarization panel carries no text.
+ * Part 7 merges the two timelines into a single dialogue model.
  */
 export function TranscriptWorkspace() {
   const { project, isLoading: isProjectLoading } = useProjectWorkspace();
@@ -83,6 +88,14 @@ export function TranscriptWorkspace() {
               </Link>
             </Button>
           }
+        />
+        <SpeakerAnalysisPanel
+          projectId={project.id}
+          media={null}
+          jobs={jobs}
+          pendingType={pendingType}
+          startJob={startJob}
+          cancelJob={cancelJob}
         />
       </section>
     );
@@ -211,9 +224,19 @@ export function TranscriptWorkspace() {
         />
       )}
 
+      <SpeakerAnalysisPanel
+        projectId={project.id}
+        media={media}
+        jobs={jobs}
+        pendingType={pendingType}
+        startJob={startJob}
+        cancelJob={cancelJob}
+      />
+
       <p className="text-xs text-muted-foreground">
-        Transcripts stay attached to the source video they were made from, and
-        are stored on the processing server during development.
+        Transcripts and speaker analysis stay attached to the source video they
+        were made from, and are stored on the processing server during
+        development.
       </p>
     </section>
   );
@@ -224,8 +247,8 @@ function TranscriptHeader() {
     <div className="space-y-1">
       <h2 className="text-base font-semibold tracking-tight">Transcript</h2>
       <p className="text-sm text-muted-foreground">
-        Convert the source speech into timestamped text. Speakers and
-        translation come in later parts.
+        Convert the source speech into timestamped text. Translation comes in a
+        later part.
       </p>
     </div>
   );

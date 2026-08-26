@@ -35,6 +35,16 @@ export function ProcessingJobResultDetails({
     );
   }
 
+  if (result.kind === "diarize") {
+    return (
+      <p className="text-xs text-muted-foreground">
+        {result.speakerCount === 0
+          ? "No speakers were detected in this source."
+          : `${result.speakerCount} ${result.speakerCount === 1 ? "speaker" : "speakers"} · ${result.regionCount} ${result.regionCount === 1 ? "region" : "regions"}`}
+      </p>
+    );
+  }
+
   const { artifact } = result;
   const parts = [
     "WAV",

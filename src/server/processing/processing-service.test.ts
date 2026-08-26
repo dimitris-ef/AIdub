@@ -175,7 +175,7 @@ describe("ProcessingService", () => {
   describe("validation", () => {
     it("rejects an unsupported job type", async () => {
       await expect(
-        harness.service.createJob(request({ type: "diarize" })),
+        harness.service.createJob(request({ type: "translate" })),
       ).rejects.toMatchObject({ code: "UNSUPPORTED_JOB_TYPE" });
     });
 
@@ -191,6 +191,19 @@ describe("ProcessingService", () => {
       expect(finished).toMatchObject({
         status: "failed",
         error: { code: "STT_PROVIDER_UNAVAILABLE" },
+      });
+    });
+
+    it("fails a diarize job when no diarization runner is wired in", async () => {
+      const job = await harness.service.createJob(request({ type: "diarize" }));
+      const finished = await harness.service.runJob(job.id, {
+        bytes: sourceBytes,
+        filename: "clip.mp4",
+      });
+
+      expect(finished).toMatchObject({
+        status: "failed",
+        error: { code: "DIARIZATION_PROVIDER_UNAVAILABLE" },
       });
     });
 

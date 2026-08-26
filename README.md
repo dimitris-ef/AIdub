@@ -15,9 +15,12 @@ contains:
   AI stages run through.
 - **Part 5: Speech-to-Text System** — provider-agnostic transcription that
   turns the source speech into persisted, timestamped segments.
+- **Part 6: Speaker Diarization** — provider-agnostic speaker analysis that
+  determines who spoke and when, as a separate persisted timeline.
 
-There is still **no** dubbing functionality: no diarization, translation,
-voices, mixing or export. Those build on this foundation in later parts.
+There is still **no** dubbing functionality: no translation, voices, mixing or
+export, and the transcript and speaker timelines are not merged. Those build on
+this foundation in later parts.
 
 ## Stack
 
@@ -31,6 +34,7 @@ voices, mixing or export. Those build on this foundation in later parts.
 | Tests       | Vitest                                       |
 | Media tools | FFmpeg + FFprobe, behind a backend adapter   |
 | Speech      | Local Whisper (sherpa-onnx) or any OpenAI-compatible STT API, behind a provider adapter |
+| Speakers    | Local pyannote segmentation + speaker embeddings (sherpa-onnx), behind a provider adapter |
 | Hosting     | Vercel                                       |
 
 ## Local development
@@ -75,6 +79,35 @@ the Transcript workspace says so instead of failing mid-job. Configuration:
 | `AIDUB_STT_BASE_URL` | Remote endpoint (default `https://api.openai.com/v1`) |
 | `AIDUB_STT_TIMEOUT_MS` | Provider timeout (default 15 minutes) |
 
+### Speaker models for local diarization
+
+The default diarization provider runs pyannote segmentation and a speaker
+embedding model on this machine, on CPU. It shares the `sherpa-onnx-node`
+runtime with transcription; the model files are downloaded separately and never
+committed:
+
+```bash
+npm run setup:diarization   # ~46 MB into .aidub/diarization-models (gitignored)
+```
+
+Both models are public ONNX exports served from a GitHub release: **no Hugging
+Face account, no access token, no GPU and no Python are required.** Without
+them the app still runs: the provider reports itself unavailable and the
+Speaker Analysis panel says so instead of failing mid-job. Configuration:
+
+| Variable | Purpose |
+| --- | --- |
+| `AIDUB_DIARIZATION_PROVIDER` | `local-pyannote` (default) or `mock` |
+| `AIDUB_DIARIZATION_MODEL_DIR` | Where the local model files live (default `.aidub/diarization-models`) |
+| `AIDUB_DIARIZATION_MODEL` | Model label recorded on results |
+| `AIDUB_DIARIZATION_CLUSTER_THRESHOLD` | Clustering distance (default `0.8`); higher merges more voices |
+| `AIDUB_DIARIZATION_TIMEOUT_MS` | Provider timeout (default 30 minutes) |
+
+A provider that needs a credential — a hosted diarization API, a Hugging Face
+gated model — reads it from a server-side variable inside its own adapter.
+Credentials are never `NEXT_PUBLIC_*`, never reach a Client Component, and are
+never written into a persisted result.
+
 ### FFmpeg for local processing
 
 Part 4's processing jobs shell out to FFmpeg and FFprobe. `npm install` brings
@@ -112,7 +145,7 @@ Vercel web layer, behind the service boundaries described below.
 | `/projects`                          | Projects dashboard: create, open, rename, delete          |
 | `/projects/[projectId]`              | Redirects to the workspace's default section (`media`)    |
 | `/projects/[projectId]/media`        | Media section — source video import, preview, replace     |
-| `/projects/[projectId]/transcript`   | Transcript section — transcribe, review timestamped text  |
+| `/projects/[projectId]/transcript`   | Transcript section — transcribe, review timestamped text, and run speaker analysis |
 | `/projects/[projectId]/translate`    | Translate section (placeholder)                           |
 | `/projects/[projectId]/voices`       | Voices section (placeholder)                              |
 | `/projects/[projectId]/mix`          | Mix section (placeholder)                                 |
@@ -131,6 +164,7 @@ Processing API (Node runtime, see Part 4):
 | `GET /api/processing/artifacts/[artifactId]`| Download a generated artifact                |
 | `GET /api/processing/capabilities`          | Whether FFmpeg/FFprobe are available         |
 | `GET /api/transcripts`                      | The stored transcript for a project + source |
+| `GET /api/diarizations`                     | The stored speaker analysis for a project + source |
 
 Workspace routes load the project identified by `[projectId]`. An id that does
 not exist in this browser renders a "Project not found" state with a route back
@@ -163,9 +197,14 @@ src/
 ├── data/media/              # MediaStorage contract + IndexedDB implementation
 ├── server/processing/       # job service, MediaProcessor, FFmpeg adapter, temp files
 ├── server/transcription/    # transcription service, STT provider contract + adapters
+├── server/diarization/      # diarization service, speaker provider contract + adapters
+│                            #   (model runs on a worker thread, off the request path)
 ├── server/artifacts/        # generated-artifact storage
 ├── data/transcripts/        # TranscriptRepository + development store
+├── data/diarization/        # DiarizationRepository + development store
 ├── components/transcript/   # transcript workspace, segment rows, status
+├── components/diarization/  # speaker analysis panel, summary, region list
+├── lib/diarization/         # speaker-id assignment and region normalisation
 ├── app/api/processing/      # processing job + artifact routes (Node runtime)
 ├── components/processing/   # job panel, status badge, progress, results
 ├── services/                # application services + processing client
@@ -951,19 +990,310 @@ translation or LLM calls, no source separation, no TTS or voice cloning, and no
 dubbing or mixing. The extracted audio is not sent to any AI provider beyond
 the configured speech-to-text one.
 
+## Part 6: Speaker Diarization
+
+Part 6 answers one question about the source audio: **who spoke, and when?**
+
+Part 5 already answers *what was said and when*. The two are deliberately kept
+apart — they are different models, different providers and different persisted
+records — and Part 7 will merge their timelines into a unified dialogue model.
+Part 6 performs **anonymous speaker clustering only**.
+
+### Diarization architecture
+
+```text
+Speaker Analysis panel (Client Component)
+        ↓ ProcessingClient.createJob({ type: "diarize" })
+POST /api/processing/jobs                     (Node runtime)
+        ↓
+ProcessingService                             (job lifecycle, temp workspace)
+        ↓ ensureAudio()  ── reuses the Part 4 canonical audio artifact
+DiarizationService                            (orchestration, normalisation)
+        ↓
+SpeakerDiarizationProvider                    (the only provider-aware layer)
+  ├── local-pyannote  (self-hosted, CPU, default)
+  └── mock            (deterministic, development only)
+        ↓ normalised speaker regions
+DiarizationRepository                         (persisted result)
+        ↓
+GET /api/diarizations → DiarizationClient → useDiarization → panel
+```
+
+Nothing above the provider adapter knows which model is used, whether it runs
+locally or remotely, whether a GPU is involved, what the vendor's response
+looks like, what it calls its speakers, or how it authenticates.
+
+### Provider abstraction
+
+```ts
+interface SpeakerDiarizationProvider {
+  readonly id: string;
+  readonly displayName: string;
+  readonly capabilities: SpeakerDiarizationProviderCapabilities;
+  isAvailable(): Promise<boolean>;
+  diarize(
+    input: SpeakerDiarizationInput,
+    context?: SpeakerDiarizationContext,
+  ): Promise<SpeakerDiarizationResult>;
+}
+```
+
+Audio arrives as a path **or** bytes, so a provider is never forced to read a
+filesystem. The context carries an `AbortSignal` and an `onProgress` callback,
+which is how cancellation and progress reach a provider without it knowing
+anything about processing jobs. Capabilities (`supportsKnownSpeakerCount`,
+`supportsSpeakerRange`, `supportsOverlappingSpeech`, `reportsConfidence`) exist
+so provider-specific behaviour never leaks upward.
+
+This is a **separate abstraction from `SpeechToTextProvider`**, on purpose.
+Even a vendor whose API transcribes and diarizes in one request is adapted as
+two application-level providers, so Aidub can always pair STT provider A with
+diarization provider B.
+
+`speaker-diarization-provider-registry.ts` resolves the active provider from
+`AIDUB_DIARIZATION_PROVIDER`; the provider name is not hard-coded anywhere else.
+
+### Initial provider
+
+`local-pyannote` runs entirely on this machine, on CPU:
+
+- **Segmentation** — pyannote/segmentation-3.0 (MIT), ONNX export, finds speech
+  turns.
+- **Embeddings** — NeMo TitaNet-small, one vector per turn.
+- **Clustering** — agglomerative clustering groups turns into speakers.
+
+Setup is `npm run setup:diarization`; see *Speaker models for local
+diarization* above. No Hugging Face token, no API key, no GPU, no Python.
+
+The analysis runs on a **worker thread**, not the request thread. It is a
+single blocking native call; on the main thread it stalls the Node event loop
+for seconds, during which the web process serves nothing — not even the cancel
+the user just clicked. Measured on the bundled 57 s fixture, moving it
+off-thread took the worst unrelated-request latency from ~3.4 s to ~16 ms.
+That worker boundary is also the seam a remote CPU/GPU worker slots into.
+
+Known limitations, stated rather than hidden:
+
+- **Speaker-count inference is not perfect.** The number of clusters comes from
+  a distance threshold (`AIDUB_DIARIZATION_CLUSTER_THRESHOLD`, default `0.8`,
+  tuned against the bundled multi-speaker fixture). Similar voices can merge and
+  one person recorded across changing conditions can split. Part 6 provides no
+  manual correction tooling; the result, the speaker count and the provider
+  metadata are stored as produced.
+- **No confidence.** Clustering distances are not calibrated probabilities, so
+  every `confidence` is `null` and nothing is invented.
+- **No provider-reported overlap.** The binding returns a flat turn list, so
+  `supportsOverlappingSpeech` is `false`. Overlap is still *representable*, and
+  the normaliser derives it where two different speakers demonstrably share time.
+- **In-process execution is a development path**, not the production
+  architecture (see below). It runs off the request thread, but it still runs
+  on the web machine and competes with it for CPU.
+
+### Speaker model
+
+```ts
+interface DiarizedSpeaker {
+  id: string;                // speaker_1, speaker_2, …
+  label: string;             // "Speaker 1"
+  confidence: number | null;
+  providerMetadata?: Record<string, unknown>;  // { rawSpeakerLabel: "cluster_3" }
+}
+```
+
+`speaker_1`, `speaker_2`, … are **anonymous cluster identities within the
+active diarization result**. They are not people. Part 6 implements no speaker
+naming, identity recognition, face recognition, voiceprint enrollment, speaker
+verification or gender classification. A later part may let a user attach a name
+or a voice; the model does not do it and does not guess.
+
+### Speaker region model
+
+```ts
+interface SpeakerRegion {
+  id: string;                // stable, crypto.randomUUID()
+  speakerId: string;         // always a canonical speaker_N
+  startTime: number;         // seconds
+  endTime: number;           // seconds
+  confidence: number | null;
+  overlap: boolean;
+  providerMetadata?: Record<string, unknown>;
+}
+```
+
+Times are **numeric seconds**, the same convention as transcript segments — a
+formatted string is never persisted. Region ids are stable and are never array
+indexes, because Part 7 may need to reference an individual region.
+
+### Normalisation rule
+
+Canonical speaker ids are assigned **by first appearance on the timeline**,
+never from the provider's own labels or ordering:
+
+```text
+provider:   SPEAKER_B 0–4s   SPEAKER_A 4–8s   SPEAKER_B 8–10s
+normalised: speaker_1        speaker_2        speaker_1
+```
+
+The full normalisation pass, in `src/lib/diarization/normalize-diarization.ts`,
+is pure and unit-tested:
+
+- rejects a missing/empty speaker label, a non-finite time, a negative start
+  beyond 50 ms of rounding noise, an end before its start, or a time well past
+  the known audio duration;
+- clamps an overshoot within 1 s of the audio duration;
+- sorts by start time, then end time, then provider label as a deterministic
+  tie-breaker;
+- collapses **exact** duplicate regions only — neighbouring regions are never
+  merged, and short regions are never dropped, because Part 7 benefits from the
+  model's own segmentation detail;
+- keeps a confidence only if it is already on a 0–1 scale, otherwise `null`;
+- marks `overlap` when the provider reports it, or when two *different*
+  speakers demonstrably share time.
+
+**Silence stays a gap.** No `speaker_unknown` is invented to fill it.
+
+An invalid result fails the job; a partially valid one is never persisted.
+
+### Audio dependency
+
+Diarization consumes the Part 4 canonical audio artifact (WAV, mono, 16 kHz)
+and never runs FFmpeg itself. Before starting it looks for an
+`extracted_audio` artifact matching this project **and** this exact
+`sourceMediaId`, and verifies its bytes still exist; metadata without bytes is
+treated as absent and regenerated through Part 4. Transcription and diarization
+of the same source therefore share **one** extraction instead of each running
+their own.
+
+### Job integration
+
+Diarization is a `diarize` **processing job** — the Part 4 job architecture,
+not a second AI-job system. Same statuses (`queued → processing →
+completed | failed | cancelled`), same progress and polling, same job-scoped
+temp directory cleaned in a `finally`, same cancellation. Progress maps:
+
+| Range | Meaning |
+| --- | --- |
+| 1–10 | preparing / reusing audio |
+| 10–30 | extracting audio when it has to be produced |
+| 30–90 | provider work (real percentage only when the provider reports one) |
+| 95 | saving the result |
+| 100 | completed |
+
+The job result is a reference, never the region list:
+
+```ts
+{ kind: "diarize", diarizationId, speakerCount, regionCount, providerId, providerModel }
+```
+
+### Cancellation
+
+Cancelling aborts the provider through the shared signal, and a result that
+arrives after the abort is discarded — a cancelled job never persists a
+completed diarization and never later flips to completed (the job model's
+transition rules make terminal states final).
+
+The local provider's analysis cannot be interrupted mid-flight, so
+cancellation **detaches** rather than kills: the caller is freed immediately,
+the job is marked cancelled, the UI stops polling, and the worker's result is
+never read. Killing the worker instead is not an option — tearing down a thread
+while the native addon is executing on it aborts the entire process. The cost
+is that an abandoned analysis keeps using CPU until it finishes on its own.
+This is a limitation of running the model in-process; it disappears once the
+model runs on a real external worker. A future remote provider that cannot
+recall an already-submitted job behaves the same way.
+
+### Persistence and schema versioning
+
+Completed results are persisted behind `DiarizationRepository` and outlive
+their job. The development implementation writes versioned JSON under
+`<os temp>/aidub/diarizations/v1/<projectId>/<id>.json` — the same convention as
+Part 5 transcripts, and for the same reason: the pipeline runs server-side, so
+the server can guarantee a result is only written after validation succeeds.
+
+Speaker names, embeddings, manual reassignment, region edits and merge/split
+metadata are expected later; adding them means writing `v2` alongside `v1` and
+migrating on read, not deleting existing data. Production replaces the store
+with a database behind the same interface.
+
+### Source identity and lifecycle
+
+A result belongs to a project, an exact `sourceMediaId` and the audio artifact
+it analysed.
+
+- **Reopening a project** reuses the stored result — same speaker ids, same
+  region ids, no automatic reprocessing.
+- **Replacing the source** produces a new media id, so the old result is not
+  current for the new source; the panel starts empty and a new job references
+  the new media and artifact. Regions are never migrated between sources.
+- **Removing the source** or **deleting the project** cancels active jobs and
+  cleans up the development results, through the service layer.
+- **Renaming a project** changes nothing: not the diarization id, the speaker
+  ids, the region ids, the source association or the provider metadata.
+- **Rediarize** keeps the working result until the new run has been stored
+  successfully; a failed rerun leaves the previous result usable.
+
+**Speaker ids are stable within a result, not across runs.** `speaker_1` from a
+new run is *not* promised to be the same person as `speaker_1` from an earlier
+independently recomputed run. Part 7 works against the active result.
+
+### Transcript independence
+
+Part 6 does not touch Part 5's data. Transcript segments gain no speaker field,
+their ids, text and timings are unchanged by diarization, and the Transcript
+rows do not display speaker attribution. A project may have a transcript only,
+a diarization only, both, or neither.
+
+### The Part 7 boundary
+
+```text
+Part 5 → TranscriptSegment[]   (what was said, when)
+Part 6 → SpeakerRegion[]       (who spoke, when)
+Part 7 → merges the two
+```
+
+Part 7 can load both independently for the same `projectId` + `sourceMediaId`.
+Both use numeric seconds, both arrive in timeline order, both carry stable ids,
+and overlapping speech is preserved rather than flattened. **No merging is
+implemented in Part 6.**
+
+### Production worker architecture
+
+The in-process execution above is the development path. Heavy diarization is
+expected to move outward:
+
+```text
+Vercel web app  →  processing coordinator  →  external CPU/GPU worker
+                                                    ↓
+                                          diarization provider/model
+                                                    ↓
+                                          persistent result storage
+```
+
+The frontend keeps talking to `ProcessingJob`s either way, so moving from a
+local development worker to a remote GPU worker requires no change to the
+Transcript workspace, the persisted models or the Part 7 merge logic. Vercel
+remains the web host, not an assumed ML worker platform.
+
+### Explicit non-goals
+
+Part 6 implements **no** transcript/speaker merging, no speaker naming or
+identity recognition, no face recognition, no voiceprint enrollment or speaker
+verification, no gender classification, no translation, no TTS or voice
+cloning, no source separation, no timing alignment and no dubbing. Audio is not
+sent to any provider beyond the configured diarization one.
+
 ## Not implemented (on purpose)
 
 Authentication, accounts, billing, a production database, cloud media storage,
 transcoding for delivery, proxy or thumbnail generation, waveform generation,
-real queues and external workers, transcription, diarization, source separation,
-LLM/translation integration, TTS, voice cloning, the persistent workspace
-player, the dubbing timeline, export/render processing, analytics and
-collaboration are all still out of scope. Part 5 stops at speech-to-text:
-transcript text is stored, and nothing is translated, attributed to a speaker,
-synthesised or mixed. There are no placeholder or mock API
-routes for them; the app ships with no `app/api` directory at all. Project and
-media persistence exist only in the temporary browser-local forms described
-above.
+real queues and external workers, source separation, LLM/translation
+integration, TTS, voice cloning, speaker naming or identity recognition, the
+persistent workspace player, the dubbing timeline, export/render processing,
+analytics and collaboration are all still out of scope. Part 6 stops at
+anonymous speaker regions: text and speakers are stored as two separate
+timelines, and nothing is merged, translated, synthesised or mixed. There are
+no placeholder or mock API routes for those features. Project and media
+persistence exist only in the temporary browser-local forms described above.
 
 ## Architectural decisions later parts must preserve
 
@@ -1075,3 +1405,35 @@ Part 5 adds:
 54. Provider secrets stay server/worker-side.
 55. Long-running transcription is never permanently tied to Vercel functions.
 56. Future translation references stable transcript segment ids.
+
+Part 6 adds:
+
+57. Speech-to-text and diarization are **independent systems**; diarization is
+    never added to `SpeechToTextProvider`, and Aidub must stay able to mix STT
+    provider A with diarization provider B.
+58. Diarization providers stay behind `SpeakerDiarizationProvider`, and the
+    Speaker Analysis UI stays provider-agnostic.
+59. Provider-specific speaker labels are **normalised before persistence** and
+    never enter the domain model; raw labels survive only in
+    `providerMetadata`.
+60. Aidub speaker ids are canonical (`speaker_1`, `speaker_2`, …), assigned by
+    **first appearance on the timeline**.
+61. Speaker ids are **anonymous clusters, not real-world identity**, and are
+    stable within a persisted result — not across independently recomputed runs.
+62. Every diarization belongs to a project **and** an exact `sourceMediaId`, and
+    references the audio artifact it was made from.
+63. Diarization consumes the Part 4 canonical audio artifact and never runs its
+    own extraction.
+64. Speaker regions use **numeric seconds** and have **stable ids**.
+65. Overlapping speaker regions stay representable and are never forced apart;
+    silence stays a timeline gap and is never filled with a placeholder speaker.
+66. Confidence is optional and never fabricated.
+67. Transcript segments are **not modified** by diarization — no speaker fields,
+    no changed text, no changed timings.
+68. Merging the transcript and speaker timelines belongs to Part 7, which
+    operates on normalised ids and timestamps, never on raw provider responses.
+69. Completed diarizations persist independently of jobs; reopening a project
+    reuses the stored result instead of rerunning the model.
+70. Replacing source media never reuses the old source's diarization.
+71. Heavy diarization may move to external CPU/GPU workers; Vercel stays the
+    web host, not the assumed ML worker platform.

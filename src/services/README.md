@@ -59,6 +59,13 @@ Speech-to-text is real as of Part 5: the same processing client creates
 transcript back. Providers, credentials and model runtimes stay in
 `src/server/transcription/`.
 
-Still absent: diarization, source separation, translation, speech synthesis and
-rendering — with no mock stand-ins. Those stages consume transcripts and
-processing artifacts through this same job architecture.
+Speaker diarization is real as of Part 6: the same processing client creates
+`diarize` jobs, and `diarization/diarization-client.ts` reads the stored
+speaker regions back. Models, credentials and runtimes stay in
+`src/server/diarization/`, behind an abstraction separate from speech-to-text
+so the two providers can be chosen independently.
+
+Still absent: transcript/speaker merging, source separation, translation,
+speech synthesis and rendering — with no mock stand-ins. Those stages consume
+transcripts, speaker regions and processing artifacts through this same job
+architecture.

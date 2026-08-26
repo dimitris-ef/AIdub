@@ -26,6 +26,7 @@ import type {
 import type { TemporaryFileManager } from "@/server/processing/temporary-file-manager";
 import type { ProcessingArtifactStorage } from "@/server/artifacts/processing-artifact-storage";
 import type { TranscriptRepository } from "@/data/transcripts";
+import type { DiarizationRepository } from "@/data/diarization";
 import type {
   ProcessingMediaSource,
   MaterializeSourceRequest,
@@ -53,9 +54,16 @@ export interface PreparedAudio {
   durationSeconds: number | null;
 }
 
-export interface TranscriptionRunner {
+/**
+ * Any provider-driven stage the processing layer can run. Transcription and
+ * diarization implement the same seam and stay independent of each other.
+ */
+export interface StageRunner {
   run(context: StageRunContext): Promise<ProcessingJob["result"]>;
 }
+
+export type TranscriptionRunner = StageRunner;
+export type DiarizationRunner = StageRunner;
 
 /**
  * Orchestrates the job lifecycle: validation, state transitions, temporary
@@ -91,8 +99,12 @@ export interface ProcessingServiceOptions {
   mediaSource: ProcessingMediaSource;
   /** Handles "transcribe" jobs; absent means transcription is unavailable. */
   transcription?: TranscriptionRunner;
+  /** Handles "diarize" jobs; absent means diarization is unavailable. */
+  diarization?: DiarizationRunner;
   /** Lets project/media cleanup dispose of transcripts too. */
   transcripts?: TranscriptRepository;
+  /** Lets project/media cleanup dispose of diarization results too. */
+  diarizations?: DiarizationRepository;
   logger?: (message: string, cause?: unknown) => void;
 }
 
@@ -107,7 +119,9 @@ export class ProcessingService {
   private readonly artifacts: ProcessingArtifactStorage;
   private readonly mediaSource: ProcessingMediaSource;
   private readonly transcription?: TranscriptionRunner;
+  private readonly diarization?: DiarizationRunner;
   private readonly transcripts?: TranscriptRepository;
+  private readonly diarizations?: DiarizationRepository;
   private readonly logger: (message: string, cause?: unknown) => void;
   /** Live jobs, so they can be aborted. Never exposed to the frontend. */
   private readonly running = new Map<string, AbortController>();
@@ -119,7 +133,9 @@ export class ProcessingService {
     this.artifacts = options.artifacts;
     this.mediaSource = options.mediaSource;
     this.transcription = options.transcription;
+    this.diarization = options.diarization;
     this.transcripts = options.transcripts;
+    this.diarizations = options.diarizations;
     this.logger = options.logger ?? defaultLogger;
   }
 
@@ -163,7 +179,7 @@ export class ProcessingService {
         status: "processing",
         progress: PROGRESS_STARTED,
         indeterminate: job.type === "probe_media",
-        stage: job.type === "transcribe" ? "Preparing audio" : null,
+        stage: isProviderStage(job.type) ? "Preparing audio" : null,
       });
 
       const result = await this.execute(job, controller.signal, source);
@@ -171,6 +187,11 @@ export class ProcessingService {
       return await this.repository.update(jobId, {
         status: "completed",
         indeterminate: false,
+        // Provider-driven stages resolve their own provider (the request may
+        // not have named one), so the job records which one actually ran.
+        ...(result && "providerId" in result
+          ? { providerId: result.providerId }
+          : {}),
         result,
         error: null,
       });
@@ -266,13 +287,16 @@ export class ProcessingService {
 
     if (sourceMediaId) {
       await this.artifacts.deleteByMedia(sourceMediaId);
-      // A transcript describes one source version; when that source is gone
-      // the transcript goes with it rather than lingering as orphaned data.
+      // A transcript and a diarization each describe one source version; when
+      // that source is gone they go with it rather than lingering as orphaned
+      // data that could be mistaken for the new source's analysis.
       await this.transcripts?.deleteByMedia(projectId, sourceMediaId);
+      await this.diarizations?.deleteByMedia(projectId, sourceMediaId);
     } else {
       await this.artifacts.deleteByProject(projectId);
       await this.repository.deleteByProject(projectId);
       await this.transcripts?.deleteByProject(projectId);
+      await this.diarizations?.deleteByProject(projectId);
     }
 
     return cancelled;
@@ -370,24 +394,49 @@ export class ProcessingService {
           );
         }
 
-        return this.transcription.run({
-          job,
-          signal,
-          ensureAudio: () => this.ensureCanonicalAudio(job, sourcePath, signal),
-          onProgress: (progress, stage) => {
-            void this.repository
-              .update(job.id, {
-                progress,
-                indeterminate: false,
-                ...(stage === undefined ? {} : { stage }),
-              })
-              .catch(() => {
-                // A dropped progress tick must never fail the job.
-              });
-          },
-        });
+        return this.runStage(this.transcription, job, sourcePath, signal);
+      }
+
+      case "diarize": {
+        if (!this.diarization) {
+          throw new ProcessingError(
+            "DIARIZATION_PROVIDER_UNAVAILABLE",
+            "Speaker diarization is not available on this server.",
+          );
+        }
+
+        return this.runStage(this.diarization, job, sourcePath, signal);
       }
     }
+  }
+
+  /**
+   * Runs one provider-driven stage. Transcription and diarization share this
+   * path — and therefore share audio reuse, progress and cancellation — while
+   * remaining completely independent of one another.
+   */
+  private runStage(
+    runner: StageRunner,
+    job: ProcessingJob,
+    sourcePath: string,
+    signal: AbortSignal,
+  ): Promise<ProcessingJob["result"]> {
+    return runner.run({
+      job,
+      signal,
+      ensureAudio: () => this.ensureCanonicalAudio(job, sourcePath, signal),
+      onProgress: (progress, stage) => {
+        void this.repository
+          .update(job.id, {
+            progress,
+            indeterminate: false,
+            ...(stage === undefined ? {} : { stage }),
+          })
+          .catch(() => {
+            // A dropped progress tick must never fail the job.
+          });
+      },
+    });
   }
 
   /**
@@ -395,6 +444,11 @@ export class ProcessingService {
    * media and its bytes are still there, and extracts it otherwise. The audio
    * is staged inside the job workspace, so it is cleaned up with the job while
    * the artifact itself survives.
+   *
+   * Every provider-driven stage goes through here, so transcription and
+   * diarization of the same source share one extraction instead of each
+   * running FFmpeg for themselves. Metadata without readable bytes is treated
+   * as absent and regenerated rather than failing the job.
    */
   private async ensureCanonicalAudio(
     job: ProcessingJob,
@@ -428,7 +482,7 @@ export class ProcessingService {
       if (!bytes) {
         throw new ProcessingError(
           "AUDIO_ARTIFACT_MISSING",
-          "Transcription could not start because the source audio is unavailable.",
+          "Processing could not start because the source audio is unavailable.",
         );
       }
     }
@@ -558,6 +612,11 @@ export class ProcessingService {
       this.logger(`temporary cleanup failed for job ${jobId}`, cause);
     }
   }
+}
+
+/** Job types that delegate to a pluggable provider rather than to FFmpeg. */
+function isProviderStage(type: ProcessingJobType): boolean {
+  return type === "transcribe" || type === "diarize";
 }
 
 /** Backend-generated filename: the user's filename never becomes a path. */

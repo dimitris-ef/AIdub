@@ -12,6 +12,7 @@ export const PROCESSING_JOB_TYPES = [
   "extract_audio",
   "convert_media",
   "transcribe",
+  "diarize",
 ] as const;
 
 export type ProcessingJobType = (typeof PROCESSING_JOB_TYPES)[number];
@@ -52,6 +53,17 @@ export const PROCESSING_ERROR_CODES = [
   "AUDIO_ARTIFACT_MISSING",
   "TRANSCRIPT_SAVE_FAILED",
   "TRANSCRIPTION_CANCELLED",
+  "DIARIZATION_PROVIDER_UNAVAILABLE",
+  "DIARIZATION_AUTHENTICATION_FAILED",
+  "DIARIZATION_REQUEST_FAILED",
+  "DIARIZATION_TIMEOUT",
+  "DIARIZATION_INVALID_RESPONSE",
+  "DIARIZATION_TIMESTAMP_INVALID",
+  "DIARIZATION_AUDIO_MISSING",
+  "DIARIZATION_AUDIO_FAILED",
+  "DIARIZATION_UNSUPPORTED_AUDIO",
+  "DIARIZATION_SAVE_FAILED",
+  "DIARIZATION_CANCELLED",
   "AUDIO_EXTRACTION_FAILED",
   "CONVERSION_FAILED",
   "TEMP_STORAGE_ERROR",
@@ -118,11 +130,25 @@ export interface TranscribeJobResult {
   providerModel: string | null;
 }
 
+/**
+ * Diarization references the saved result rather than repeating it: speakers
+ * and regions are persisted in their own store and outlive the job.
+ */
+export interface DiarizationJobResult {
+  kind: "diarize";
+  diarizationId: string;
+  speakerCount: number;
+  regionCount: number;
+  providerId: string;
+  providerModel: string | null;
+}
+
 export type ProcessingJobResult =
   | ProbeJobResult
   | ExtractAudioJobResult
   | ConvertMediaJobResult
   | TranscribeJobResult
+  | DiarizationJobResult
   | null;
 
 export interface ProcessingJob {
@@ -143,7 +169,7 @@ export interface ProcessingJob {
   completedAt: string | null;
   error: ProcessingJobError | null;
   result: ProcessingJobResult;
-  /** Set by jobs that use a pluggable provider (transcription today). */
+  /** Set by jobs that use a pluggable provider (transcription, diarization). */
   providerId: string | null;
   /** Optional source-language hint for providers that accept one. */
   languageHint: string | null;

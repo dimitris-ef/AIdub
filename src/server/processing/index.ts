@@ -7,7 +7,9 @@ import { UploadedProcessingMediaSource } from "@/server/processing/processing-me
 import { ProcessingService } from "@/server/processing/processing-service";
 import { LocalTemporaryFileManager } from "@/server/processing/temporary-file-manager";
 import { TranscriptionService } from "@/server/transcription/transcription-service";
+import { DiarizationService } from "@/server/diarization/diarization-service";
 import { transcriptRepository } from "@/data/transcripts";
+import { diarizationRepository } from "@/data/diarization";
 
 /**
  * Server-side wiring. `server-only` keeps this module — and everything it
@@ -32,8 +34,11 @@ function createProcessingService(): ProcessingService {
     temporaryFiles: new LocalTemporaryFileManager(),
     artifacts: new DevelopmentArtifactStorage(),
     mediaSource: new UploadedProcessingMediaSource(),
+    // Two independent provider-driven stages sharing one job architecture.
     transcription: new TranscriptionService(),
+    diarization: new DiarizationService(),
     transcripts: transcriptRepository,
+    diarizations: diarizationRepository,
   });
 }
 

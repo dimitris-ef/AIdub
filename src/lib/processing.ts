@@ -53,6 +53,7 @@ const JOB_TYPE_LABELS: Record<ProcessingJobType, string> = {
   extract_audio: "Extract audio",
   convert_media: "Convert audio",
   transcribe: "Transcribe speech",
+  diarize: "Analyse speakers",
 };
 
 export function getJobTypeLabel(type: ProcessingJobType | string): string {
