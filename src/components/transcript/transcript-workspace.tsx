@@ -17,6 +17,7 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ProcessingErrorMessage } from "@/components/processing/processing-job-status";
 import { SpeakerAnalysisPanel } from "@/components/diarization/speaker-analysis-panel";
+import { DialoguePreview } from "@/components/dialogue/dialogue-preview";
 import { TranscriptMessage } from "@/components/transcript/transcript-empty-state";
 import { TranscriptSegmentRow } from "@/components/transcript/transcript-segment-row";
 import { TranscriptionStatus } from "@/components/transcript/transcription-status";
@@ -30,9 +31,11 @@ import { TranscriptionStatus } from "@/components/transcript/transcription-statu
  * `TranscriptClient`.
  *
  * Speaker Analysis (Part 6) shares this section because speaker work is part
- * of preparing a transcript, but the two remain independent: transcript rows
- * carry no speaker information, and the diarization panel carries no text.
- * Part 7 merges the two timelines into a single dialogue model.
+ * of preparing a transcript, but the raw layers remain independent: transcript
+ * rows carry no speaker information, and the diarization panel carries no
+ * text. Part 7's Dialogue preview is the layer above both — it shows the two
+ * timelines combined without replacing either, so the raw outputs stay
+ * inspectable.
  */
 export function TranscriptWorkspace() {
   const { project, isLoading: isProjectLoading } = useProjectWorkspace();
@@ -52,6 +55,13 @@ export function TranscriptWorkspace() {
   const completedJobId = transcriptionJobs.find(
     (job) => job.status === "completed",
   )?.id;
+
+  // The dialogue is derived from both raw layers, so it is refetched whenever
+  // either of them produces a new result.
+  const completedDiarizationJobId = jobs.find(
+    (job) => job.type === "diarize" && job.status === "completed",
+  )?.id;
+  const dialogueRevision = `${completedJobId ?? ""}::${completedDiarizationJobId ?? ""}`;
 
   const {
     status: transcriptStatus,
@@ -96,6 +106,11 @@ export function TranscriptWorkspace() {
           pendingType={pendingType}
           startJob={startJob}
           cancelJob={cancelJob}
+        />
+        <DialoguePreview
+          projectId={project.id}
+          sourceMediaId={null}
+          revision={dialogueRevision}
         />
       </section>
     );
@@ -231,6 +246,12 @@ export function TranscriptWorkspace() {
         pendingType={pendingType}
         startJob={startJob}
         cancelJob={cancelJob}
+      />
+
+      <DialoguePreview
+        projectId={project.id}
+        sourceMediaId={media.id}
+        revision={dialogueRevision}
       />
 
       <p className="text-xs text-muted-foreground">

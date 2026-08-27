@@ -10,6 +10,7 @@ import { TranscriptionService } from "@/server/transcription/transcription-servi
 import { DiarizationService } from "@/server/diarization/diarization-service";
 import { transcriptRepository } from "@/data/transcripts";
 import { diarizationRepository } from "@/data/diarization";
+import { dialogueRepository } from "@/data/dialogue";
 
 /**
  * Server-side wiring. `server-only` keeps this module — and everything it
@@ -39,6 +40,7 @@ function createProcessingService(): ProcessingService {
     diarization: new DiarizationService(),
     transcripts: transcriptRepository,
     diarizations: diarizationRepository,
+    dialogues: dialogueRepository,
   });
 }
 

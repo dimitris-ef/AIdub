@@ -83,6 +83,22 @@ Non-negotiables for new work:
   and leave silence as a gap — never a placeholder speaker.
 - Part 6 must not modify transcript segments. Merging the transcript and
   speaker timelines is Part 7's job, working on normalised ids and timestamps.
+- The unified dialogue in `src/types/dialogue.ts` is **derived**. Merging reads
+  the raw transcript and diarization and never writes to them; both stay
+  persisted so a dialogue can always be regenerated.
+- Merge logic lives in `src/lib/dialogue/` as pure functions over the
+  normalised Part 5/6 models. It must never import a provider, and providers
+  must never assign speakers to text.
+- Speaker assignment is temporal overlap aggregated per speaker. Ambiguity is
+  represented explicitly (`speakerId: null` plus assignment metadata) — never
+  guessed, and never resolved by array order or speaker id.
+- Without word-level timings, transcript text is never split across speakers.
+- Dialogue segment ids derive from transcript segment ids and stay stable once
+  persisted; `mergeMetadata` records the algorithm version and thresholds.
+- A dialogue is stale when its transcript, diarization, source, schema or
+  algorithm version changes, and must be regenerated rather than served.
+- Later parts consume `UnifiedDialogue`, not raw STT plus diarization. Part 8
+  owns editing and must revisit regeneration before overwriting user edits.
 - Never fabricate confidence: unusable provider values become `null` and stay
   in `providerMetadata`.
 - Run `npm run lint`, `npm run typecheck`, `npm test` and `npm run build` before

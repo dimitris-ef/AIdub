@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   DiarizationRequestError,
@@ -52,6 +52,11 @@ function createClient(
 }
 
 describe("HttpDiarizationClient", () => {
+  // The stubbed fetch must never outlive this file.
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("asks for one project and one exact source media", async () => {
     const { client, fetchImpl } = createClient(
       () => new Response(JSON.stringify({ diarization: wireResult })),

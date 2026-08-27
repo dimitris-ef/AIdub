@@ -17,10 +17,12 @@ contains:
   turns the source speech into persisted, timestamped segments.
 - **Part 6: Speaker Diarization** — provider-agnostic speaker analysis that
   determines who spoke and when, as a separate persisted timeline.
+- **Part 7: Unified Transcript + Speaker Model** — the derived dialogue model
+  that combines the two into who said what, and when.
 
-There is still **no** dubbing functionality: no translation, voices, mixing or
-export, and the transcript and speaker timelines are not merged. Those build on
-this foundation in later parts.
+There is still **no** dubbing functionality: no transcript editing,
+translation, voices, mixing or export. Those build on this foundation in later
+parts.
 
 ## Stack
 
@@ -145,7 +147,7 @@ Vercel web layer, behind the service boundaries described below.
 | `/projects`                          | Projects dashboard: create, open, rename, delete          |
 | `/projects/[projectId]`              | Redirects to the workspace's default section (`media`)    |
 | `/projects/[projectId]/media`        | Media section — source video import, preview, replace     |
-| `/projects/[projectId]/transcript`   | Transcript section — transcribe, review timestamped text, and run speaker analysis |
+| `/projects/[projectId]/transcript`   | Transcript section — transcribe, run speaker analysis, review the unified dialogue |
 | `/projects/[projectId]/translate`    | Translate section (placeholder)                           |
 | `/projects/[projectId]/voices`       | Voices section (placeholder)                              |
 | `/projects/[projectId]/mix`          | Mix section (placeholder)                                 |
@@ -165,6 +167,7 @@ Processing API (Node runtime, see Part 4):
 | `GET /api/processing/capabilities`          | Whether FFmpeg/FFprobe are available         |
 | `GET /api/transcripts`                      | The stored transcript for a project + source |
 | `GET /api/diarizations`                     | The stored speaker analysis for a project + source |
+| `GET /api/dialogue`                         | The unified dialogue for a project + source (generated lazily) |
 
 Workspace routes load the project identified by `[projectId]`. An id that does
 not exist in this browser renders a "Project not found" state with a route back
@@ -202,6 +205,10 @@ src/
 ├── server/artifacts/        # generated-artifact storage
 ├── data/transcripts/        # TranscriptRepository + development store
 ├── data/diarization/        # DiarizationRepository + development store
+├── server/dialogue/         # dialogue service: prerequisites, staleness, regeneration
+├── data/dialogue/           # UnifiedDialogueRepository + development store
+├── lib/dialogue/            # interval math, merge algorithm, thresholds, staleness
+├── components/dialogue/     # read-only dialogue preview, segment rows, badges
 ├── components/transcript/   # transcript workspace, segment rows, status
 ├── components/diarization/  # speaker analysis panel, summary, region list
 ├── lib/diarization/         # speaker-id assignment and region normalisation
@@ -1282,18 +1289,256 @@ verification, no gender classification, no translation, no TTS or voice
 cloning, no source separation, no timing alignment and no dubbing. Audio is not
 sent to any provider beyond the configured diarization one.
 
+## Part 7: Unified Transcript + Speaker Model
+
+Parts 5 and 6 answer half a question each. Part 7 puts them together:
+
+```text
+Part 5 → TranscriptSegment[]   what was said, and when
+Part 6 → SpeakerRegion[]       who spoke, and when
+Part 7 → DialogueSegment[]     who said what, and when
+```
+
+### Unified architecture
+
+```text
+Transcript (raw, persisted)  ─┐
+                              ├─→ DialogueMergeService ─→ UnifiedDialogue
+DiarizationResult (raw, ──────┘         (pure merge)          ↓
+                   persisted)                        UnifiedDialogueRepository
+                                                              ↓
+                                        GET /api/dialogue → DialogueClient → UI
+```
+
+The merge consumes **only** the normalised Part 5 and Part 6 domain models. It
+has never heard of Whisper, pyannote, response formats, provider speaker
+labels, credentials or model files — which is exactly what lets any STT
+provider pair with any diarization provider, and what makes the algorithm
+cheap to test. Speaker-assignment logic lives in neither provider interface.
+
+### Raw results are preserved
+
+The unified dialogue is **derived**. Merging reads the raw results and writes
+only to its own store:
+
+- the raw transcript stays persisted and unchanged;
+- the raw diarization stays persisted and unchanged;
+- the raw Transcript rows and Speaker Analysis panel stay visible, so Part 7
+  adds a layer rather than replacing the ones beneath it;
+- the dialogue can be deleted and rebuilt from the raw inputs at any time.
+
+That matters because merge logic will improve, thresholds will be retuned, and
+models will be rerun. A derived layer can be thrown away; raw results cannot.
+
+### Dialogue model
+
+```ts
+interface UnifiedDialogue {
+  id; projectId; sourceMediaId;
+  transcriptId;      // the exact raw inputs this was derived from
+  diarizationId;
+  version;           // persisted schema version
+  status: "completed" | "failed";
+  segments: DialogueSegment[];   // ordered by start time
+  createdAt; updatedAt;
+  mergeMetadata: DialogueMergeMetadata;
+}
+```
+
+`mergeMetadata` records the algorithm version, both input ids, when it ran, the
+exact thresholds used, and how many segments came out ambiguous, overlapping or
+unassigned — so any stored dialogue stays explainable later.
+
+### Dialogue segment model
+
+```ts
+interface DialogueSegment {
+  id: string;                  // derived from the transcript segment id
+  speakerId: string | null;    // canonical speaker_N, or null when unassigned
+  startTime: number;           // seconds
+  endTime: number;             // seconds
+  originalText: string;        // Part 5's text, unchanged
+  transcription: { transcriptId, transcriptSegmentId, confidence, status,
+                   providerId, providerModel };
+  diarization:   { diarizationId, regionIds, confidence, overlap,
+                   candidateSpeakers, providerId, providerModel };
+  assignment:    { method, confidence, overlapRatio, uncertain, reason };
+}
+```
+
+**Segment ids** are the transcript segment's own id. Regenerating from the same
+transcript therefore reproduces the same ids, so state that later parts attach
+to a line survives a rebuild. If word timestamps ever enable splitting one
+transcript segment across speakers, the derived halves take suffixed ids
+(`t-123:a`, `t-123:b`) so each stays distinct and stable. Array indexes are
+never used as identity.
+
+### Speaker assignment strategy
+
+Assignment is temporal. For each transcript segment:
+
+1. **Aggregate overlap per speaker.** Several regions from the same speaker are
+   one candidate, not several.
+2. **No overlap at all** → look for the nearest region within
+   `nearestRegionMaxGap`. Within it, assign with `method: "nearest_region"` and
+   `uncertain: true`; beyond it, leave the segment unassigned. Real silence is
+   never bridged, and two speakers equally near resolve to neither.
+3. **One candidate** → assign it (`single_overlap`). Coverage below
+   `minSpeakerCoverage` keeps the assignment but flags it rather than
+   overstating it.
+4. **Several candidates** → a competitor only counts when it holds at least
+   `splitMinimumDuration` of speech the leading speaker was *not* also
+   producing. This is what separates a real second turn from boundary jitter,
+   and what stops someone talking *over* the leader from looking like a turn
+   change.
+5. With a real competitor, the leader needs `dominantSpeakerRatio` of the
+   attributed speech (`dominant_overlap`); otherwise the segment is
+   **ambiguous and left unassigned**. An exact tie is always ambiguous — never
+   broken by array order or speaker id.
+
+### Merge configuration
+
+Centralised in `src/lib/dialogue/merge-config.ts` and snapshotted onto every
+dialogue. Defaults, chosen deliberately:
+
+| Threshold | Default | Why |
+| --- | --- | --- |
+| `minSpeakerCoverage` | `0.5` | Below half a segment, a speaker is plausible but not solid |
+| `dominantSpeakerRatio` | `0.75` | A 3:1 majority is a clear winner; nearer an even split is not resolvable without word timings |
+| `splitMinimumDuration` | `0.2 s` | Shorter is boundary noise between two models, not a turn |
+| `nearestRegionMaxGap` | `0.4 s` | Covers observed drift between the two models, far below any real pause |
+
+These are tuning, not truth. Retuning them changes results, which is why the
+values used are stored with each dialogue.
+
+### Segments spanning multiple speakers
+
+This is the case that most invites false precision, so the rule is explicit:
+
+> **Without word-level timings, text is never divided.**
+
+A transcript segment gives no evidence about which of its words fall on either
+side of a speaker boundary. Splitting text by character count, or by ratio,
+would invent that evidence. Instead such a segment keeps its **full text**,
+names the dominant speaker when one exists, and reports
+`uncertain: true` with the reason
+`multiple_speakers_without_word_timestamps`. If no speaker dominates, the
+speaker is `null` and the text is still preserved for correction in Part 8.
+
+**No provider currently in Aidub emits word timestamps**, so the splitting
+branch is not exercised today. The model is ready for it: `assignment.method`
+reserves `"split"`, the id scheme above covers derived segments, and the plan
+is documented under *Dialogue segment model*. When a provider supplies word
+timings, splitting would associate each word with a speaker region, group
+consecutive words by speaker, preserve word order and punctuation, narrow each
+derived segment's timing to its own words, and keep every part traceable to the
+original transcript segment.
+
+### Overlapping speech
+
+Overlap is preserved, never flattened. When two different speakers share time
+inside a segment, `diarization.overlap` is `true`, every candidate speaker
+stays in `candidateSpeakers` with its overlap duration and ratio, and the
+segment is marked uncertain even if a dominant speaker was assigned. A speaker
+talking over another does not remove the leader's claim to the line, but it
+does mean the words may be interleaved — and the UI says so.
+
+### Silence and missing coverage
+
+A transcript segment with no speaker coverage is left unassigned
+(`speakerId: null`) rather than given an invented speaker. No
+`speaker_unknown` is minted. Diarization gaps stay gaps.
+
+### Uncertainty and confidence
+
+Two different things, kept apart:
+
+- `assignment.confidence` is a **merge** confidence — the share of attributed
+  speech belonging to the assigned speaker. It measures how cleanly the two
+  timelines agreed, and nothing about any model's certainty.
+- `transcription.confidence` and `diarization.confidence` are **provider**
+  values, passed through untouched, and `null` wherever the provider reports
+  nothing comparable. Neither is ever fabricated.
+
+`assignment.overlapRatio` reports how much of the segment the assigned speaker
+covers, and `assignment.reason` names why a segment is uncertain.
+
+### Algorithm versioning and staleness
+
+Every dialogue records `mergeMetadata.algorithmVersion`
+(`dialogue-merge-v1`). A stored dialogue is current only for the exact
+`projectId`, `sourceMediaId`, `transcriptId`, `diarizationId`, storage schema
+and algorithm version that produced it. Change any of them — retranscribe,
+rediarize, replace the source, ship new merge logic — and it is **stale** and
+regenerated rather than served.
+
+### Generation and regeneration
+
+Generation is **lazy**: the first read after both prerequisites exist produces
+and persists the dialogue; later reads reuse it until an input changes. That
+keeps Part 5 and Part 6 unaware of each other — neither service knows a merge
+exists — and needs no processing job, because merging is deterministic
+in-memory work rather than model inference.
+
+Missing prerequisites come back as a state, never a fabricated dialogue:
+`transcript_required`, `diarization_required`, `source_mismatch` or `failed`.
+An STT result from one source is never combined with a diarization from
+another, however compatible their timestamps look.
+
+Regeneration replaces the previous dialogue only once the new one is stored.
+**Part 8 will have to revisit that policy**: once a user can edit dialogue,
+overwriting on regeneration would discard their work, and an editable revision
+layer (or explicit manual-edit state) becomes necessary. Part 7 is purely
+derived and read-only, so replacement is safe for now.
+
+### Lifecycle
+
+- **Reopening a project** reuses the stored dialogue — same dialogue id, same
+  segment ids, no re-merge.
+- **Replacing the source** gives a new media id, so the old transcript,
+  diarization and dialogue all stay tied to the old source and none appears as
+  current for the new one.
+- **Renaming a project** changes nothing: not the dialogue id, the segment ids,
+  the raw input ids, the speaker ids or the source association.
+- **Deleting media or a project** removes the derived dialogue alongside the
+  raw results, through the service layer.
+
+### Transcript workspace integration
+
+The Transcript section shows three layers: the raw transcript, the raw Speaker
+Analysis, and — above both — a **read-only** Dialogue preview with the speaker,
+timing and text per line, plus `Uncertain` / `Unassigned` / `Overlap` badges.
+
+It is not an editor. Editable text, speaker dropdowns, split and merge
+controls, timing handles and inline translation all belong to Part 8 or later.
+
+### The stable internal contract
+
+Future features — transcript editing, translation, voice assignment, TTS,
+timing, mix, export — should consume `UnifiedDialogue` rather than loading a
+transcript and a diarization and correlating them again. The raw results stay
+available for regeneration and debugging, but they are not the downstream
+contract.
+
+### Explicit non-goals
+
+Part 7 implements **no** transcript editing, no translation, no TTS or voice
+cloning, no voice assignment, no source separation, no timing alignment and no
+dubbing or mixing. It aligns existing data; it does not change what was said.
+
 ## Not implemented (on purpose)
 
 Authentication, accounts, billing, a production database, cloud media storage,
 transcoding for delivery, proxy or thumbnail generation, waveform generation,
 real queues and external workers, source separation, LLM/translation
-integration, TTS, voice cloning, speaker naming or identity recognition, the
-persistent workspace player, the dubbing timeline, export/render processing,
-analytics and collaboration are all still out of scope. Part 6 stops at
-anonymous speaker regions: text and speakers are stored as two separate
-timelines, and nothing is merged, translated, synthesised or mixed. There are
-no placeholder or mock API routes for those features. Project and media
-persistence exist only in the temporary browser-local forms described above.
+integration, TTS, voice cloning, speaker naming or identity recognition,
+transcript editing, the persistent workspace player, the dubbing timeline,
+export/render processing, analytics and collaboration are all still out of
+scope. Part 7 stops at the derived dialogue model: who said what and when is
+now one representation, and nothing is edited, translated, synthesised or
+mixed. There are no placeholder or mock API routes for those features. Project
+and media persistence exist only in the temporary browser-local forms described
+above.
 
 ## Architectural decisions later parts must preserve
 
@@ -1437,3 +1682,38 @@ Part 6 adds:
 70. Replacing source media never reuses the old source's diarization.
 71. Heavy diarization may move to external CPU/GPU workers; Vercel stays the
     web host, not the assumed ML worker platform.
+
+Part 7 adds:
+
+72. Raw STT and diarization results are **independent, immutable inputs** to
+    merging; the merge reads them and never writes to them.
+73. The unified dialogue is a **derived** application model, produced by the
+    merge layer — never by a provider.
+74. A dialogue references the exact `transcriptId` and `diarizationId` it was
+    derived from, and belongs to an exact project and source media id.
+75. Dialogue segments use **numeric seconds** and preserve Part 5's
+    `originalText` unchanged — no translation, rewriting or correction.
+76. Canonical speaker ids come from Part 6; the dialogue never mints its own.
+77. Speaker assignment is based primarily on **temporal overlap**, aggregated
+    per speaker.
+78. Ambiguous assignments are represented explicitly (`speakerId: null` plus
+    assignment metadata), never guessed, and never decided by array order.
+79. Overlapping speech stays represented; large silence gaps are never bridged,
+    while small timing drift may use the nearest-region fallback.
+80. **Without word timestamps, text is never split across speakers.**
+81. Segment ids are stable once persisted, and derived from the transcript
+    segment they trace to.
+82. The merge algorithm version and its configuration are recorded on every
+    dialogue.
+83. A dialogue becomes stale when its transcript, diarization, source, schema
+    or algorithm version changes, and is regenerated rather than served.
+84. Raw transcript and diarization must remain available for regeneration.
+85. Transcript editing, translation, voice assignment, TTS, timing, mix and
+    export consume the `UnifiedDialogue` contract rather than rejoining raw
+    STT and diarization themselves.
+86. Part 7 dialogue is read-only and derived; Part 8 owns manual editing, and
+    must revisit the regeneration policy before overwriting user edits.
+87. STT and diarization providers remain independently replaceable — the merge
+    layer imports neither.
+88. Dialogue persistence must remain replaceable with production database
+    infrastructure.

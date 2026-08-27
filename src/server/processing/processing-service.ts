@@ -27,6 +27,7 @@ import type { TemporaryFileManager } from "@/server/processing/temporary-file-ma
 import type { ProcessingArtifactStorage } from "@/server/artifacts/processing-artifact-storage";
 import type { TranscriptRepository } from "@/data/transcripts";
 import type { DiarizationRepository } from "@/data/diarization";
+import type { UnifiedDialogueRepository } from "@/data/dialogue";
 import type {
   ProcessingMediaSource,
   MaterializeSourceRequest,
@@ -105,6 +106,8 @@ export interface ProcessingServiceOptions {
   transcripts?: TranscriptRepository;
   /** Lets project/media cleanup dispose of diarization results too. */
   diarizations?: DiarizationRepository;
+  /** Lets project/media cleanup dispose of derived dialogue too. */
+  dialogues?: UnifiedDialogueRepository;
   logger?: (message: string, cause?: unknown) => void;
 }
 
@@ -122,6 +125,7 @@ export class ProcessingService {
   private readonly diarization?: DiarizationRunner;
   private readonly transcripts?: TranscriptRepository;
   private readonly diarizations?: DiarizationRepository;
+  private readonly dialogues?: UnifiedDialogueRepository;
   private readonly logger: (message: string, cause?: unknown) => void;
   /** Live jobs, so they can be aborted. Never exposed to the frontend. */
   private readonly running = new Map<string, AbortController>();
@@ -136,6 +140,7 @@ export class ProcessingService {
     this.diarization = options.diarization;
     this.transcripts = options.transcripts;
     this.diarizations = options.diarizations;
+    this.dialogues = options.dialogues;
     this.logger = options.logger ?? defaultLogger;
   }
 
@@ -292,11 +297,14 @@ export class ProcessingService {
       // data that could be mistaken for the new source's analysis.
       await this.transcripts?.deleteByMedia(projectId, sourceMediaId);
       await this.diarizations?.deleteByMedia(projectId, sourceMediaId);
+      // The dialogue is derived from both, so it goes with them.
+      await this.dialogues?.deleteByMedia(projectId, sourceMediaId);
     } else {
       await this.artifacts.deleteByProject(projectId);
       await this.repository.deleteByProject(projectId);
       await this.transcripts?.deleteByProject(projectId);
       await this.diarizations?.deleteByProject(projectId);
+      await this.dialogues?.deleteByProject(projectId);
     }
 
     return cancelled;

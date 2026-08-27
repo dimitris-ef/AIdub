@@ -14,7 +14,7 @@ export function AppSidebar() {
         <PrimaryNav />
       </nav>
       <div className="p-4 text-[11px] leading-relaxed text-muted-foreground">
-        <p className="font-medium text-foreground/70">Part 6 · Speakers</p>
+        <p className="font-medium text-foreground/70">Part 7 · Dialogue</p>
         <p>Translation, voices and dubbing arrive in later parts.</p>
       </div>
     </aside>

@@ -65,7 +65,11 @@ speaker regions back. Models, credentials and runtimes stay in
 `src/server/diarization/`, behind an abstraction separate from speech-to-text
 so the two providers can be chosen independently.
 
-Still absent: transcript/speaker merging, source separation, translation,
-speech synthesis and rendering — with no mock stand-ins. Those stages consume
-transcripts, speaker regions and processing artifacts through this same job
-architecture.
+The unified dialogue is real as of Part 7: `dialogue/dialogue-client.ts` reads
+"who said what, and when" for a source, generated lazily server-side from the
+raw transcript and diarization. It is the contract later stages should consume
+— they should not load the raw results and correlate them again.
+
+Still absent: transcript editing, source separation, translation, speech
+synthesis and rendering — with no mock stand-ins. Those stages consume the
+unified dialogue and processing artifacts through this same architecture.
