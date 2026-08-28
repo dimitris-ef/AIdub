@@ -70,6 +70,11 @@ The unified dialogue is real as of Part 7: `dialogue/dialogue-client.ts` reads
 raw transcript and diarization. It is the contract later stages should consume
 — they should not load the raw results and correlate them again.
 
-Still absent: transcript editing, source separation, translation, speech
-synthesis and rendering — with no mock stand-ins. Those stages consume the
-unified dialogue and processing artifacts through this same architecture.
+Dialogue editing is real as of Part 8: the same client applies corrections
+through `PATCH /api/dialogue`, which derives, validates and persists a new
+document server-side. Raw STT and diarization are never touched.
+
+Still absent: source separation, translation, speech synthesis, timing
+alignment and rendering — with no mock stand-ins. Those stages consume the
+edited unified dialogue and processing artifacts through this same
+architecture.

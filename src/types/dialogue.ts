@@ -11,6 +11,12 @@
  * Because it is derived, a dialogue is only valid for the exact transcript,
  * diarization and merge algorithm that produced it — see `mergeMetadata` and
  * the staleness rules in `@/lib/dialogue/dialogue-staleness`.
+ *
+ * From Part 8 it is also **editable**. Human corrections — text, speaker,
+ * timing, structure, speaker names — are applied here and nowhere else: the
+ * raw transcript and diarization stay untouched, and `editMetadata` records
+ * that the document has diverged from its generated baseline so regeneration
+ * can never silently discard someone's work.
  */
 
 export const DIALOGUE_STATUSES = ["completed", "failed"] as const;
@@ -26,6 +32,7 @@ export type DialogueStatus = (typeof DIALOGUE_STATUSES)[number];
  * - `unassigned`       no defensible assignment; `speakerId` is null
  * - `split`            reserved for word-timestamp-driven splitting; never
  *                      produced today (see the Part 7 README section)
+ * - `manual`           a person chose this speaker; authoritative downstream
  */
 export const SPEAKER_ASSIGNMENT_METHODS = [
   "single_overlap",
@@ -33,6 +40,7 @@ export const SPEAKER_ASSIGNMENT_METHODS = [
   "split",
   "nearest_region",
   "unassigned",
+  "manual",
 ] as const;
 
 export type SpeakerAssignmentMethod =
@@ -68,6 +76,16 @@ export interface SpeakerAssignmentMetadata {
   overlapRatio: number | null;
   uncertain: boolean;
   reason: AssignmentReason | null;
+  /**
+   * What the merge decided before a person overrode it. Kept for provenance:
+   * a manual assignment is authoritative, but why the algorithm disagreed is
+   * still worth being able to look up.
+   */
+  automatic?: {
+    method: SpeakerAssignmentMethod;
+    speakerId: string | null;
+    reason: AssignmentReason | null;
+  };
 }
 
 /** One speaker that overlapped a segment, whether or not it was assigned. */
@@ -104,6 +122,19 @@ export interface DialogueDiarizationMetadata {
   providerModel: string | null;
 }
 
+/** What a person changed on one segment, relative to the merged baseline. */
+export interface DialogueSegmentEditMetadata {
+  manuallyEditedText: boolean;
+  manuallyEditedSpeaker: boolean;
+  manuallyEditedTiming: boolean;
+  manuallyChangedStructure: boolean;
+  /**
+   * Dialogue segments this one came from when it was split or merged. Empty
+   * for a segment that still maps one-to-one to its transcript segment.
+   */
+  parentSegmentIds: string[];
+}
+
 export interface DialogueSegment {
   /** Stable across regeneration: derived from the transcript segment id. */
   id: string;
@@ -111,11 +142,46 @@ export interface DialogueSegment {
   speakerId: string | null;
   startTime: number;
   endTime: number;
-  /** The Part 5 text, unchanged — never translated, rewritten or corrected. */
+  /**
+   * The reviewed original-language text. It starts as Part 5's text verbatim
+   * and is the one field a person may rewrite; the raw transcript keeps its
+   * own copy untouched. Never a translation.
+   */
   originalText: string;
   transcription: DialogueTranscriptionMetadata;
   diarization: DialogueDiarizationMetadata;
   assignment: SpeakerAssignmentMetadata;
+  editMetadata: DialogueSegmentEditMetadata;
+}
+
+/**
+ * A speaker as the dialogue knows them: a stable id that downstream systems
+ * join on, plus a display name a person may change freely.
+ *
+ * The name is dialogue metadata, never written back to Part 6. `id` stays
+ * canonical (`speaker_1`) so renaming changes nothing structural, and
+ * `sourceSpeakerIds` records which diarization clusters a person decided were
+ * the same voice.
+ */
+export interface DialogueSpeaker {
+  id: string;
+  /** Display name. Editable; defaults to the Part 6 label. */
+  name: string;
+  /** Diarization speaker ids folded into this one, including its own. */
+  sourceSpeakerIds: string[];
+  createdManually: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Whether, and how much, this dialogue has diverged from its baseline. */
+export interface DialogueEditMetadata {
+  hasManualEdits: boolean;
+  /** Bumped once per persisted correction, not per keystroke. */
+  revision: number;
+  editedAt: string | null;
+  /** The merge algorithm the edited document was built on top of. */
+  baselineAlgorithmVersion: string;
 }
 
 /** Configuration a merge ran with, recorded so results stay explainable. */
@@ -150,9 +216,24 @@ export interface UnifiedDialogue {
   status: DialogueStatus;
   /** Ordered by start time; see the merge ordering rule. */
   segments: DialogueSegment[];
+  /** Editable speaker records; every non-null `speakerId` resolves here. */
+  speakers: DialogueSpeaker[];
   createdAt: string;
   updatedAt: string;
   mergeMetadata: DialogueMergeMetadata;
+  editMetadata: DialogueEditMetadata;
+}
+
+/** A segment's speaker name, falling back to its id when unresolved. */
+export function speakerDisplayName(
+  speakers: readonly DialogueSpeaker[],
+  speakerId: string | null,
+): string {
+  if (!speakerId) {
+    return "Unassigned";
+  }
+
+  return speakers.find((speaker) => speaker.id === speakerId)?.name ?? speakerId;
 }
 
 export function isDialogueStatus(value: unknown): value is DialogueStatus {

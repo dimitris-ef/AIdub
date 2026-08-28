@@ -103,8 +103,12 @@ export class DevelopmentTranscriptRepository implements TranscriptRepository {
       return null;
     }
 
+    // Newest wins, with the id as a tie-breaker so two records written in the
+    // same millisecond still resolve deterministically.
     return matches.sort(
-      (a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt),
+      (a, b) =>
+        Date.parse(b.updatedAt) - Date.parse(a.updatedAt) ||
+        (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
     )[0];
   }
 

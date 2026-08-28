@@ -63,6 +63,13 @@ function buildDialogue(
           uncertain: false,
           reason: null,
         },
+        editMetadata: {
+          manuallyEditedText: false,
+          manuallyEditedSpeaker: false,
+          manuallyEditedTiming: false,
+          manuallyChangedStructure: false,
+          parentSegmentIds: [],
+        },
       },
       {
         id: "t-2",
@@ -94,6 +101,23 @@ function buildDialogue(
           uncertain: true,
           reason: "no_nearby_speaker",
         },
+        editMetadata: {
+          manuallyEditedText: false,
+          manuallyEditedSpeaker: false,
+          manuallyEditedTiming: false,
+          manuallyChangedStructure: false,
+          parentSegmentIds: [],
+        },
+      },
+    ],
+    speakers: [
+      {
+        id: "speaker_1",
+        name: "Speaker 1",
+        sourceSpeakerIds: ["speaker_1"],
+        createdManually: false,
+        createdAt: "2026-08-27T10:00:00.000Z",
+        updatedAt: "2026-08-27T10:00:00.000Z",
       },
     ],
     createdAt: "2026-08-27T10:00:00.000Z",
@@ -107,6 +131,12 @@ function buildDialogue(
       ambiguousSegmentCount: 1,
       overlappingSegmentCount: 0,
       unassignedSegmentCount: 1,
+    },
+    editMetadata: {
+      hasManualEdits: false,
+      revision: 0,
+      editedAt: null,
+      baselineAlgorithmVersion: MERGE_ALGORITHM_VERSION,
     },
     ...overrides,
   };

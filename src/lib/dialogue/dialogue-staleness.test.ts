@@ -35,6 +35,7 @@ function dialogue(overrides: Partial<UnifiedDialogue> = {}): UnifiedDialogue {
     version: DIALOGUE_SCHEMA_VERSION,
     status: "completed",
     segments: [],
+    speakers: [],
     createdAt: "2026-08-27T10:00:00.000Z",
     updatedAt: "2026-08-27T10:00:00.000Z",
     mergeMetadata: {
@@ -46,6 +47,12 @@ function dialogue(overrides: Partial<UnifiedDialogue> = {}): UnifiedDialogue {
       ambiguousSegmentCount: 0,
       overlappingSegmentCount: 0,
       unassignedSegmentCount: 0,
+    },
+    editMetadata: {
+      hasManualEdits: false,
+      revision: 0,
+      editedAt: null,
+      baselineAlgorithmVersion: MERGE_ALGORITHM_VERSION,
     },
     ...overrides,
   };

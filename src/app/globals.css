@@ -42,6 +42,16 @@
   --sidebar-accent: oklch(0.95 0.006 264);
   --sidebar-accent-foreground: oklch(0.27 0.01 264);
   --sidebar-ring: oklch(0.58 0.11 205);
+
+  /*
+   * Speaker tones. Used to tell voices apart at a glance in the transcript
+   * and on the timeline; never the only cue — every speaker is also named.
+   */
+  --speaker-1: oklch(0.58 0.11 205);
+  --speaker-2: oklch(0.6 0.13 300);
+  --speaker-3: oklch(0.62 0.13 145);
+  --speaker-4: oklch(0.66 0.13 65);
+  --speaker-5: oklch(0.6 0.14 20);
 }
 
 .dark {
@@ -71,6 +81,12 @@
   --sidebar-accent: oklch(0.25 0.009 264);
   --sidebar-accent-foreground: oklch(0.97 0.003 264);
   --sidebar-ring: oklch(0.75 0.11 200);
+
+  --speaker-1: oklch(0.75 0.11 200);
+  --speaker-2: oklch(0.74 0.13 305);
+  --speaker-3: oklch(0.76 0.13 150);
+  --speaker-4: oklch(0.79 0.12 75);
+  --speaker-5: oklch(0.72 0.14 25);
 }
 
 @theme inline {
@@ -103,6 +119,12 @@
   --color-sidebar-accent: var(--sidebar-accent);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
   --color-sidebar-ring: var(--sidebar-ring);
+
+  --color-speaker-1: var(--speaker-1);
+  --color-speaker-2: var(--speaker-2);
+  --color-speaker-3: var(--speaker-3);
+  --color-speaker-4: var(--speaker-4);
+  --color-speaker-5: var(--speaker-5);
 
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);

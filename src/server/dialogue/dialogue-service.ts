@@ -17,7 +17,10 @@ import {
   toConfigSnapshot,
   type DialogueMergeConfig,
 } from "@/lib/dialogue/merge-config";
-import { dialogueCurrency } from "@/lib/dialogue/dialogue-staleness";
+import {
+  dialogueCurrency,
+  type DialogueStaleReason,
+} from "@/lib/dialogue/dialogue-staleness";
 
 /**
  * Orchestrates the unified dialogue: fetch the current raw inputs, check they
@@ -45,12 +48,23 @@ export const DIALOGUE_STATES = [
 
 export type DialogueState = (typeof DIALOGUE_STATES)[number];
 
+/**
+ * Set when the active dialogue was built from raw results that are no longer
+ * current, and was kept anyway because it carries manual corrections.
+ */
+export interface DialogueStaleBaseline {
+  reason: DialogueStaleReason;
+  currentTranscriptId: string;
+  currentDiarizationId: string;
+}
+
 export type DialogueResolution =
   | {
       state: "ready";
       dialogue: UnifiedDialogue;
       /** True when this call produced the dialogue rather than reusing one. */
       regenerated: boolean;
+      staleBaseline?: DialogueStaleBaseline;
     }
   | {
       state: Exclude<DialogueState, "ready">;
@@ -146,6 +160,30 @@ export class DialogueService {
         return { state: "ready", dialogue: stored, regenerated: false };
       }
 
+      // Once a person has corrected the dialogue, newer raw results must never
+      // silently replace their work. The edited document stays active and the
+      // caller is told its baseline has moved on, so a future part can offer
+      // an explicit reconciliation rather than a surprise overwrite.
+      if (stored.editMetadata.hasManualEdits) {
+        this.logger("keeping manually edited dialogue over newer raw results", {
+          projectId,
+          dialogueId: stored.id,
+          reason: currency.reason,
+          revision: stored.editMetadata.revision,
+        });
+
+        return {
+          state: "ready",
+          dialogue: stored,
+          regenerated: false,
+          staleBaseline: {
+            reason: currency.reason,
+            currentTranscriptId: transcript.id,
+            currentDiarizationId: diarization.id,
+          },
+        };
+      }
+
       this.logger("regenerating stale dialogue", {
         projectId,
         dialogueId: stored.id,
@@ -157,10 +195,12 @@ export class DialogueService {
   }
 
   /**
-   * Rebuilds the dialogue from raw inputs. Part 7 dialogue is purely derived,
-   * so replacing the previous one is safe; Part 8 introduces manual edits and
-   * will have to revisit this policy before overwriting anything a user
-   * touched.
+   * Rebuilds the dialogue from raw inputs.
+   *
+   * Only ever reached for a dialogue with no manual corrections — a document
+   * someone has edited is preserved instead (see `getCurrentDialogue`), and
+   * reconciling edits against newer raw results is deliberately left to a
+   * later part rather than guessed at here.
    */
   async regenerate(
     transcript: Transcript,
@@ -192,6 +232,7 @@ export class DialogueService {
       version: DIALOGUE_SCHEMA_VERSION,
       status: "completed",
       segments: outcome.draft.segments,
+      speakers: outcome.draft.speakers,
       createdAt: timestamp,
       updatedAt: timestamp,
       mergeMetadata: {
@@ -203,6 +244,13 @@ export class DialogueService {
         ambiguousSegmentCount: outcome.draft.ambiguousSegmentCount,
         overlappingSegmentCount: outcome.draft.overlappingSegmentCount,
         unassignedSegmentCount: outcome.draft.unassignedSegmentCount,
+      },
+      // A freshly generated dialogue carries no corrections yet.
+      editMetadata: {
+        hasManualEdits: false,
+        revision: 0,
+        editedAt: null,
+        baselineAlgorithmVersion: MERGE_ALGORITHM_VERSION,
       },
     };
 

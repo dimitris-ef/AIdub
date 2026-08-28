@@ -47,6 +47,23 @@ const wireDialogue = {
         uncertain: true,
         reason: "overlapping_speech",
       },
+      editMetadata: {
+        manuallyEditedText: false,
+        manuallyEditedSpeaker: false,
+        manuallyEditedTiming: false,
+        manuallyChangedStructure: false,
+        parentSegmentIds: [],
+      },
+    },
+  ],
+  speakers: [
+    {
+      id: "speaker_1",
+      name: "Speaker 1",
+      sourceSpeakerIds: ["speaker_1"],
+      createdManually: false,
+      createdAt: "2026-08-27T10:00:00.000Z",
+      updatedAt: "2026-08-27T10:00:00.000Z",
     },
   ],
   createdAt: "2026-08-27T10:00:00.000Z",
@@ -65,6 +82,12 @@ const wireDialogue = {
     ambiguousSegmentCount: 1,
     overlappingSegmentCount: 1,
     unassignedSegmentCount: 0,
+  },
+  editMetadata: {
+    hasManualEdits: false,
+    revision: 0,
+    editedAt: null,
+    baselineAlgorithmVersion: "dialogue-merge-v1",
   },
 };
 

@@ -17,6 +17,8 @@ export interface UseDialogueResult {
   /** Why there is no dialogue, when there isn't one. */
   state: DialogueState | null;
   dialogue: UnifiedDialogue | null;
+  /** Set when manual corrections are being kept over newer raw results. */
+  staleBaseline: { reason: string } | undefined;
   error: string | null;
   reload: () => void;
 }
@@ -25,6 +27,7 @@ interface Resolution {
   key: string;
   state: DialogueState;
   dialogue: UnifiedDialogue | null;
+  staleBaseline: { reason: string } | undefined;
   error: string | null;
 }
 
@@ -64,6 +67,7 @@ export function useDialogue(
             key,
             state: response.state,
             dialogue: response.dialogue,
+            staleBaseline: response.staleBaseline,
             error: null,
           });
         }
@@ -74,6 +78,7 @@ export function useDialogue(
             key,
             state: "failed",
             dialogue: null,
+            staleBaseline: undefined,
             error:
               cause instanceof DialogueRequestError
                 ? cause.message
@@ -95,6 +100,7 @@ export function useDialogue(
       status: "loaded",
       state: "transcript_required",
       dialogue: null,
+      staleBaseline: undefined,
       error: null,
       reload: () => setReloadToken((token) => token + 1),
     };
@@ -104,6 +110,8 @@ export function useDialogue(
     status: isCurrent && resolution ? (resolution.error ? "error" : "loaded") : "loading",
     state: isCurrent && resolution ? resolution.state : null,
     dialogue: isCurrent && resolution ? resolution.dialogue : null,
+    staleBaseline:
+      isCurrent && resolution ? resolution.staleBaseline : undefined,
     error: isCurrent && resolution ? resolution.error : null,
     reload: () => setReloadToken((token) => token + 1),
   };

@@ -3,6 +3,7 @@ import type { Transcript, TranscriptSegment } from "@/types/transcript";
 import type {
   AssignmentReason,
   DialogueSegment,
+  DialogueSpeaker,
   DialogueSpeakerCandidate,
   SpeakerAssignmentMetadata,
   SpeakerAssignmentMethod,
@@ -56,6 +57,8 @@ import {
 
 export interface MergeDialogueDraft {
   segments: DialogueSegment[];
+  /** One editable record per diarization speaker, named from its label. */
+  speakers: DialogueSpeaker[];
   ambiguousSegmentCount: number;
   overlappingSegmentCount: number;
   unassignedSegmentCount: number;
@@ -122,10 +125,22 @@ export function mergeDialogue(
       (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
   );
 
+  // One editable speaker record per diarization cluster, seeded from Part 6's
+  // label. From here the name is the dialogue's to change; the id is not.
+  const speakers: DialogueSpeaker[] = diarization.speakers.map((speaker) => ({
+    id: speaker.id,
+    name: speaker.label,
+    sourceSpeakerIds: [speaker.id],
+    createdManually: false,
+    createdAt: diarization.createdAt,
+    updatedAt: diarization.createdAt,
+  }));
+
   return {
     ok: true,
     draft: {
       segments,
+      speakers,
       ambiguousSegmentCount: segments.filter(
         (segment) => segment.assignment.uncertain,
       ).length,
@@ -212,6 +227,15 @@ function buildSegment(
       providerModel: diarization.providerModel,
     },
     assignment,
+    // A freshly merged segment carries no corrections and no structural
+    // history; Part 8 fills these in as a person works.
+    editMetadata: {
+      manuallyEditedText: false,
+      manuallyEditedSpeaker: false,
+      manuallyEditedTiming: false,
+      manuallyChangedStructure: false,
+      parentSegmentIds: [],
+    },
   };
 }
 

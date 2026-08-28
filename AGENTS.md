@@ -97,8 +97,27 @@ Non-negotiables for new work:
   persisted; `mergeMetadata` records the algorithm version and thresholds.
 - A dialogue is stale when its transcript, diarization, source, schema or
   algorithm version changes, and must be regenerated rather than served.
-- Later parts consume `UnifiedDialogue`, not raw STT plus diarization. Part 8
-  owns editing and must revisit regeneration before overwriting user edits.
+- Later parts consume the **edited** `UnifiedDialogue`, not raw STT plus
+  diarization.
+- Human corrections (text, speaker, timing, structure, speaker names) apply to
+  the dialogue only. Raw STT and diarization stay immutable — the editor
+  service cannot reach those stores, and that must stay true.
+- Edit operations live in `src/lib/dialogue/dialogue-edit-operations.ts` as
+  pure functions; the service only loads, persists and validates. A structural
+  edit lands whole or not at all.
+- Speaker ids are stable and separate from editable display names; renaming
+  never changes an id and no segment stores a copy of a name.
+- Manual speaker assignment is authoritative and is never re-decided by the
+  merge on load; overlap metadata survives it.
+- Without word timings, text is never split automatically — a person places the
+  boundary.
+- Segment merge requires adjacency and the same speaker; segment ids stay
+  stable and never derive from array position.
+- Invalid timing never persists, and timing edits are local: no ripple editing.
+- Once `editMetadata.hasManualEdits` is true, new STT/diarization results must
+  never overwrite the dialogue — surface the stale baseline instead.
+- Playback time stays out of React state; transcript rows must not re-render on
+  every frame.
 - Never fabricate confidence: unusable provider values become `null` and stay
   in `providerMetadata`.
 - Run `npm run lint`, `npm run typecheck`, `npm test` and `npm run build` before

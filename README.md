@@ -19,10 +19,11 @@ contains:
   determines who spoke and when, as a separate persisted timeline.
 - **Part 7: Unified Transcript + Speaker Model** — the derived dialogue model
   that combines the two into who said what, and when.
+- **Part 8: Transcript & Speaker Editor** — the synchronised review workspace
+  where a person corrects that dialogue, without touching the raw results.
 
-There is still **no** dubbing functionality: no transcript editing,
-translation, voices, mixing or export. Those build on this foundation in later
-parts.
+There is still **no** dubbing functionality: no translation, voices, mixing or
+export. Those build on this foundation in later parts.
 
 ## Stack
 
@@ -147,7 +148,7 @@ Vercel web layer, behind the service boundaries described below.
 | `/projects`                          | Projects dashboard: create, open, rename, delete          |
 | `/projects/[projectId]`              | Redirects to the workspace's default section (`media`)    |
 | `/projects/[projectId]/media`        | Media section — source video import, preview, replace     |
-| `/projects/[projectId]/transcript`   | Transcript section — transcribe, run speaker analysis, review the unified dialogue |
+| `/projects/[projectId]/transcript`   | Transcript section — transcribe, run speaker analysis, and review and correct the dialogue |
 | `/projects/[projectId]/translate`    | Translate section (placeholder)                           |
 | `/projects/[projectId]/voices`       | Voices section (placeholder)                              |
 | `/projects/[projectId]/mix`          | Mix section (placeholder)                                 |
@@ -168,6 +169,7 @@ Processing API (Node runtime, see Part 4):
 | `GET /api/transcripts`                      | The stored transcript for a project + source |
 | `GET /api/diarizations`                     | The stored speaker analysis for a project + source |
 | `GET /api/dialogue`                         | The unified dialogue for a project + source (generated lazily) |
+| `PATCH /api/dialogue`                       | Applies one human correction to the stored dialogue |
 
 Workspace routes load the project identified by `[projectId]`. An id that does
 not exist in this browser renders a "Project not found" state with a route back
@@ -207,8 +209,11 @@ src/
 ├── data/diarization/        # DiarizationRepository + development store
 ├── server/dialogue/         # dialogue service: prerequisites, staleness, regeneration
 ├── data/dialogue/           # UnifiedDialogueRepository + development store
-├── lib/dialogue/            # interval math, merge algorithm, thresholds, staleness
-├── components/dialogue/     # read-only dialogue preview, segment rows, badges
+├── lib/dialogue/            # interval math, merge algorithm, thresholds,
+│                            #   staleness, edit operations, validation
+├── components/dialogue/     # assignment and overlap badges
+├── components/player/       # project video player, wired to shared playback state
+├── components/timeline/     # dialogue timeline, playhead, resize handles
 ├── components/transcript/   # transcript workspace, segment rows, status
 ├── components/diarization/  # speaker analysis panel, summary, region list
 ├── lib/diarization/         # speaker-id assignment and region normalisation
@@ -1526,19 +1531,221 @@ Part 7 implements **no** transcript editing, no translation, no TTS or voice
 cloning, no voice assignment, no source separation, no timing alignment and no
 dubbing or mixing. It aligns existing data; it does not change what was said.
 
+## Part 8: Transcript & Speaker Editor
+
+Part 7 produced a dialogue a machine derived. Part 8 turns it into a document a
+person owns: the Transcript section becomes a synchronised review workspace
+where the video, the transcript and a timeline share one selection, and where
+text, speakers, timing and segment structure can all be corrected.
+
+### Data hierarchy
+
+```text
+Raw STT (immutable)  ─┐
+                      ├─→ generated unified dialogue ─→ manual corrections
+Raw diarization ──────┘                                        ↓
+   (immutable)                                    editable unified dialogue
+                                                               ↓
+                              translation · voices · TTS · timing · mix · export
+```
+
+### Raw data is immutable
+
+**Correcting dialogue never modifies the transcript or the diarization.** Not
+when text is rewritten, not when a speaker is renamed, reassigned or merged,
+not when a segment is split, merged or retimed. The editor service has no
+access to those stores at all, which is the simplest guarantee available, and
+the promise is covered by tests that snapshot both raw records, run every
+correction operation, and compare them afterwards.
+
+The raw layers also stay *visible*: the Part 5 transcript and the Part 6
+Speaker Analysis panel remain in the workspace beside the editor, so what the
+models actually produced can still be checked against a correction. The raw
+transcript sits behind a disclosure to keep it out of the way — except when it
+found no speech at all, which is an outcome rather than a detail (it is what
+distinguishes silence from a failed transcription), so that state is shown
+directly.
+
+### Speaker model
+
+```ts
+interface DialogueSpeaker {
+  id: string;               // speaker_1 — stable, what everything joins on
+  name: string;             // "Alice" — editable display metadata
+  sourceSpeakerIds: string[];  // diarization clusters folded into this one
+  createdManually: boolean;
+  createdAt; updatedAt;
+}
+```
+
+Renaming changes `name` only. The id every segment references is untouched, so
+nothing downstream has to be re-pointed and no segment stores a copy of the
+name — rows resolve it from the speaker record, which is why one rename updates
+every line at once. Part 6's own `DiarizedSpeaker.label` is never written to.
+
+### Dialogue edit state
+
+```ts
+interface DialogueEditMetadata {
+  hasManualEdits: boolean;
+  revision: number;          // one per persisted correction, not per keystroke
+  editedAt: string | null;
+  baselineAlgorithmVersion: string;
+}
+
+interface DialogueSegmentEditMetadata {
+  manuallyEditedText / Speaker / Timing: boolean;
+  manuallyChangedStructure: boolean;
+  parentSegmentIds: string[];   // where a split or merged segment came from
+}
+```
+
+Storage schema moved to **v2**. A v1 dialogue is migrated on read — speaker
+records are reconstructed from its segments — rather than discarded for a field
+addition.
+
+### Synchronisation
+
+One stable segment id ties the transcript, the timeline and the player
+together, and two ids describe what is happening:
+
+- `selectedSegmentId` — chosen by a person. Clicking a transcript row or a
+  timeline block selects it, seeks the video to its start (**without**
+  autoplaying) and highlights it in the other view.
+- `activeSegmentId` — derived from playback position
+  (`startTime <= currentTime < endTime`).
+
+Keeping them separate is what stops the video advancing from pulling focus out
+of a line someone is typing in.
+
+Playback time is deliberately **not** React state. It lives in a small external
+store that only the playhead and the transport readout subscribe to, so the
+frame-rate updates never re-render the transcript rows or their open textareas.
+Rows are memoised and re-render only when their own segment, or their
+selected/active flags, actually change. The shared state lives in
+`ProjectEditorProvider` at the workspace layout, so Translate, Voices, Mix and
+Export can consume the same playhead and selection later.
+
+### Text editing
+
+The reviewed text is `DialogueSegment.originalText`; the raw transcript keeps
+its own copy. Edits commit on blur — one persisted correction per edit, not one
+per character — and Escape abandons an in-progress edit. Outer whitespace is
+trimmed on commit and the wording is otherwise left exactly as typed. **Empty
+text is allowed**: a false-positive transcription is a real thing to correct,
+and blanking the line is more honest than inventing words for it; the line
+keeps its timing and provenance so it can still be reassigned or merged away.
+
+### Speaker reassignment
+
+A manual choice is authoritative. `assignment.method` becomes `manual`, the
+uncertainty the merge reported is cleared, and what the algorithm had decided
+is preserved under `assignment.automatic` for provenance. Automatic assignment
+is never reapplied on load. **Overlap metadata is deliberately untouched** —
+choosing a primary speaker does not make overlapping speech disappear, and
+later dubbing needs to know.
+
+### Speaker merge
+
+Folding `speaker_3` into `speaker_1` reassigns every line, records both cluster
+ids in the survivor's `sourceSpeakerIds`, removes the source from the dialogue's
+speaker list, and bumps the revision — all in one derived document that is
+validated before it is written. A failed save leaves the previous document
+exactly as it was; there is no half-merged state. Merging a speaker into itself
+is refused. The confirmation says plainly that only this dialogue changes.
+
+### Segment split
+
+Timing splits exactly at the playhead. **Text does not split itself.** Without
+word-level timings nothing knows which words fall on either side, so the split
+dialog shows the line, offers the word boundaries as buttons, previews both
+halves, and asks. Each half may be given its own speaker, which is the usual
+reason to split in the first place.
+
+Both halves keep the original's transcript segment id and region ids, and
+record the parent in `parentSegmentIds`. Ids are derived from the parent
+(`t-3:a`, `t-3:b`) so they are deterministic and traceable; repeated splits stay
+unique. No provider currently emits word timings, so the word-timestamp path
+described in Part 7 remains unexercised.
+
+### Segment merge
+
+Restricted to lines that are **adjacent on the timeline** and belong to the
+**same speaker** — silently discarding one of two speakers' attributions would
+be a destructive edit dressed up as a convenience, so the control is disabled
+and the operation refused. To merge across speakers, reassign one first. The
+survivor spans both, joins the text in order, and inherits the union of both
+sides' region ids and their overlap flag.
+
+### Timing edits
+
+Times are typed as timecodes (`00:12.450`, `1:02:14.820`) and parsed back to
+canonical seconds by `parseTimecode`; the formatted string is only ever
+displayed. A selected block's edges can also be dragged on the timeline.
+
+Validation rejects a negative start, an end at or before the start, non-finite
+values and an end beyond the media duration, and nothing invalid is persisted.
+Editing is **local**: gaps and overlaps are both legitimate, neighbours are
+never shifted or trimmed to compensate, and a newly created overlap is reported
+rather than prevented. There is no ripple editing.
+
+### Save behaviour
+
+Every correction is applied server-side against the stored document through
+`PATCH /api/dialogue`, so validation and atomicity live in one place and a
+client can never write a document derived from a stale copy. The saved result
+replaces local state, which means what is on screen is what was persisted. A
+failed save keeps the previous document and says so — an edit is never reported
+as saved when the store rejected it.
+
+A save in flight does **not** disable the text, timing and speaker fields. Text
+commits on blur, and the two timestamps of a pair are separate fields, so the
+first one committing starts a save while the second is still being typed —
+disabling the row there would throw the entry away. Those edits are keyed to
+stable segment ids and compose server-side, and a field only resyncs from the
+store while it is not focused, so an in-progress correction is never
+overwritten by an arriving one. Only *Split* and *Merge up* wait for the save,
+because they depend on the document's current shape.
+
+### Regeneration safety
+
+Once `editMetadata.hasManualEdits` is true, **new transcription or diarization
+results never overwrite the dialogue**. The edited document stays active and
+the response carries a `staleBaseline` describing what changed, which the
+workspace surfaces as a notice. Reconciling corrections against newer raw
+results is a genuine merge problem and is deliberately left to a later part
+rather than guessed at here. A dialogue nobody has edited still regenerates
+normally.
+
+### Timeline scope
+
+One dialogue track: position, duration, speaker, selection and a playhead that
+follows playback. It is **not** the Mix timeline — no music tracks, stems, TTS
+waveforms, multitrack mixing or render tracks. Very short lines are drawn with
+a minimum clickable width; that affects only what is drawn, never the stored
+timestamps. Speaker tones come from design tokens and are assigned
+deterministically from the speaker id, and are always paired with the speaker's
+name in text rather than being the only cue.
+
+### Explicit non-goals
+
+Part 8 implements **no** translation, no TTS or voice cloning, no voice
+assignment, no source separation, no automatic timing alignment or TTS duration
+fitting, and no dubbing, mixing or export. It corrects the original-language
+dialogue; it does not generate anything.
+
 ## Not implemented (on purpose)
 
 Authentication, accounts, billing, a production database, cloud media storage,
 transcoding for delivery, proxy or thumbnail generation, waveform generation,
 real queues and external workers, source separation, LLM/translation
 integration, TTS, voice cloning, speaker naming or identity recognition,
-transcript editing, the persistent workspace player, the dubbing timeline,
-export/render processing, analytics and collaboration are all still out of
-scope. Part 7 stops at the derived dialogue model: who said what and when is
-now one representation, and nothing is edited, translated, synthesised or
-mixed. There are no placeholder or mock API routes for those features. Project
-and media persistence exist only in the temporary browser-local forms described
-above.
+the dubbing/mixing timeline, export/render processing, analytics and
+collaboration are all still out of scope. Part 8 stops at reviewed dialogue:
+who said what and when can now be corrected by hand, and nothing is translated,
+synthesised, aligned or mixed. There are no placeholder or mock API routes for
+those features. Project and media persistence exist only in the temporary
+browser-local forms described above.
 
 ## Architectural decisions later parts must preserve
 
@@ -1717,3 +1924,33 @@ Part 7 adds:
     layer imports neither.
 88. Dialogue persistence must remain replaceable with production database
     infrastructure.
+
+Part 8 adds:
+
+89. Raw STT and raw diarization stay **immutable** after manual edits; user
+    corrections modify only the editable unified dialogue.
+90. Stable speaker ids are separate from editable display names; renaming
+    never changes an id, and no segment stores a copy of a name.
+91. Manual speaker reassignment is authoritative downstream and is never
+    re-decided by automatic assignment on load.
+92. Speaker merging updates the dialogue only, keeps the target's stable id,
+    and records both diarization clusters in `sourceSpeakerIds`.
+93. Dialogue text edits replace the reviewed downstream text but not raw STT
+    text; timestamps stay numeric seconds.
+94. Segment ids stay stable and never depend on array position; split and
+    merged segments record their parents.
+95. Invalid timestamp edits must never persist, and timing edits stay local —
+    no ripple editing, no silent adjustment of neighbours.
+96. Overlap information survives manual speaker edits.
+97. Unassigned and uncertain segments stay explicitly representable and
+    visible.
+98. Transcript, timeline and video use the same dialogue segment ids; playback
+    `active` state and user `selected` state stay conceptually separate.
+99. Manual edits are never automatically overwritten by regenerated STT or
+    diarization; a stale baseline is surfaced, not resolved.
+100. Later Translation, TTS, Timing, Mix and Export consume the **edited**
+     unified dialogue.
+101. The final multitrack dubbing/mixing timeline is not Part 8's timeline.
+102. Dialogue editing persistence stays behind repository/service abstractions,
+     and Vercel remains the web host while heavy processing stays
+     external-worker-ready.

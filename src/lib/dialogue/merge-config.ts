@@ -63,8 +63,15 @@ export const DEFAULT_MERGE_CONFIG: DialogueMergeConfig = {
  */
 export const MERGE_ALGORITHM_VERSION = "dialogue-merge-v1";
 
-/** Persisted shape version for stored dialogues. */
-export const DIALOGUE_SCHEMA_VERSION = 1;
+/**
+ * Persisted shape version for stored dialogues.
+ *
+ * v1 — Part 7: derived segments only.
+ * v2 — Part 8: editable speaker records and edit metadata. A v1 record is
+ *      migrated on read rather than discarded (see the repository), because a
+ *      schema addition must never cost a user their generated dialogue.
+ */
+export const DIALOGUE_SCHEMA_VERSION = 2;
 
 export function resolveMergeConfig(
   overrides: Partial<DialogueMergeConfig> = {},
