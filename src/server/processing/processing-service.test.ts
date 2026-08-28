@@ -43,6 +43,7 @@ const PROBE_WITHOUT_AUDIO: ProbeMediaResult = {
 /** Scriptable processor: no FFmpeg, no child processes. */
 class FakeMediaProcessor implements MediaProcessor {
   probeResult: ProbeMediaResult = PROBE_WITH_AUDIO;
+  probeCalls = 0;
   probeError: Error | null = null;
   extractError: Error | null = null;
   /** Resolves only when released, so cancellation can be exercised. */
@@ -62,6 +63,8 @@ class FakeMediaProcessor implements MediaProcessor {
   }
 
   async probe(input: ProbeMediaInput): Promise<ProbeMediaResult> {
+    this.probeCalls += 1;
+
     if (this.probeError) {
       throw this.probeError;
     }
@@ -132,7 +135,10 @@ async function exists(target: string): Promise<boolean> {
 
 const sourceBytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
 
-function createHarness(root: string) {
+function createHarness(
+  root: string,
+  options: Partial<ConstructorParameters<typeof ProcessingService>[0]> = {},
+) {
   const processor = new FakeMediaProcessor();
   const temporaryFiles = new LocalTemporaryFileManager(root);
   const artifacts = new DevelopmentArtifactStorage(
@@ -146,6 +152,7 @@ function createHarness(root: string) {
     artifacts,
     mediaSource: new UploadedProcessingMediaSource(),
     logger: () => {},
+    ...options,
   });
 
   return { processor, temporaryFiles, artifacts, repository, service, root };
@@ -175,8 +182,30 @@ describe("ProcessingService", () => {
   describe("validation", () => {
     it("rejects an unsupported job type", async () => {
       await expect(
-        harness.service.createJob(request({ type: "translate" })),
+        harness.service.createJob(request({ type: "render_dub" })),
       ).rejects.toMatchObject({ code: "UNSUPPORTED_JOB_TYPE" });
+    });
+
+    it("fails a translate job when no translation runner is wired in", async () => {
+      const job = await harness.service.createJob(
+        request({
+          type: "translate",
+          uploadedSource: undefined,
+          parameters: {
+            kind: "translate",
+            dialogueId: "dialogue-1",
+            dialogueRevision: 0,
+            sourceLanguage: "en",
+            targetLanguage: "pl",
+          },
+        }),
+      );
+      const finished = await harness.service.runJob(job.id, undefined);
+
+      expect(finished).toMatchObject({
+        status: "failed",
+        error: { code: "TRANSLATION_PROVIDER_UNAVAILABLE" },
+      });
     });
 
     it("fails a transcribe job when no transcription runner is wired in", async () => {
@@ -227,6 +256,111 @@ describe("ProcessingService", () => {
           }),
         ),
       ).rejects.toMatchObject({ code: "SOURCE_MEDIA_NOT_FOUND" });
+    });
+
+    it("accepts a translate job with no source bytes at all", async () => {
+      // Translation reads the stored dialogue, so requiring an upload would
+      // mean shipping a whole video across the network to translate text.
+      const job = await harness.service.createJob(
+        request({
+          type: "translate",
+          uploadedSource: undefined,
+          parameters: {
+            kind: "translate",
+            dialogueId: "dialogue-1",
+            dialogueRevision: 3,
+            sourceLanguage: "en",
+            targetLanguage: "pl",
+          },
+        }),
+      );
+
+      expect(job.status).toBe("queued");
+      expect(job.parameters).toMatchObject({
+        kind: "translate",
+        dialogueRevision: 3,
+      });
+    });
+
+    it("rejects a translate job created without translation parameters", async () => {
+      await expect(
+        harness.service.createJob(
+          request({ type: "translate", uploadedSource: undefined }),
+        ),
+      ).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+    });
+  });
+
+  describe("media-free stages", () => {
+    it("runs a translate job without materialising or probing the source", async () => {
+      const runner = {
+        run: vi.fn(async () => ({
+          kind: "translate" as const,
+          translationId: "translation-1",
+          dialogueId: "dialogue-1",
+          dialogueRevision: 3,
+          segmentCount: 2,
+          sourceLanguage: "en",
+          targetLanguage: "pl",
+          providerId: "mock",
+          providerModel: "deterministic-v1",
+        })),
+      };
+      const local = createHarness(root, { translation: runner });
+
+      const created = await local.service.createJob(
+        request({
+          type: "translate",
+          uploadedSource: undefined,
+          parameters: {
+            kind: "translate",
+            dialogueId: "dialogue-1",
+            dialogueRevision: 3,
+            sourceLanguage: "en",
+            targetLanguage: "pl",
+          },
+        }),
+      );
+      const finished = await local.service.runJob(created.id, undefined);
+
+      expect(finished.status).toBe("completed");
+      expect(finished.result).toMatchObject({ kind: "translate" });
+      // No FFmpeg ran: the stage never touched the media at all.
+      expect(local.processor.probeCalls).toBe(0);
+      expect(local.processor.extractCalls).toHaveLength(0);
+    });
+
+    it("gives a media-free stage no way to reach for audio", async () => {
+      let audioError: unknown;
+      const runner = {
+        run: vi.fn(async (context: { ensureAudio: () => unknown }) => {
+          try {
+            context.ensureAudio();
+          } catch (cause) {
+            audioError = cause;
+          }
+
+          return null;
+        }),
+      };
+      const service = createHarness(root, { translation: runner }).service;
+
+      const created = await service.createJob(
+        request({
+          type: "translate",
+          uploadedSource: undefined,
+          parameters: {
+            kind: "translate",
+            dialogueId: "dialogue-1",
+            dialogueRevision: 0,
+            sourceLanguage: "en",
+            targetLanguage: "pl",
+          },
+        }),
+      );
+      await service.runJob(created.id, undefined);
+
+      expect(audioError).toBeInstanceOf(ProcessingError);
     });
   });
 

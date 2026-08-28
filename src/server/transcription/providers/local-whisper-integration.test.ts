@@ -77,6 +77,7 @@ const job: ProcessingJob = {
   providerId: "local-whisper",
   languageHint: "en",
   audioArtifactId: null,
+  parameters: null,
 };
 
 describe.skipIf(!modelsPresent || !fixturePresent)(

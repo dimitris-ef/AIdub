@@ -114,11 +114,47 @@ export class DialogueService {
   }
 
   /**
+   * Generation in flight, keyed by project and source.
+   *
+   * Lazy generation has to be idempotent: a workspace can easily ask for the
+   * dialogue twice at once (Transcript and Translate both need it), and two
+   * concurrent generations would each mint a dialogue id, persist it, and then
+   * delete what they took to be the superseded record — leaving callers holding
+   * an id that no longer exists. Sharing one in-flight generation makes
+   * concurrent readers agree on the same dialogue.
+   *
+   * This is per-process, which is exactly right for the development execution
+   * model; a multi-instance deployment resolves the same problem with a
+   * transaction or a unique constraint in the database behind the repository.
+   */
+  private readonly generating = new Map<string, Promise<DialogueResolution>>();
+
+  /**
    * The dialogue a caller should show for this source right now, generating or
    * regenerating it when needed. Missing prerequisites come back as a state,
    * never as a fabricated dialogue.
    */
   async getCurrentDialogue(
+    projectId: string,
+    sourceMediaId: string,
+  ): Promise<DialogueResolution> {
+    const key = `${projectId}::${sourceMediaId}`;
+    const inFlight = this.generating.get(key);
+
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const resolution = this.resolve(projectId, sourceMediaId).finally(() => {
+      this.generating.delete(key);
+    });
+
+    this.generating.set(key, resolution);
+
+    return resolution;
+  }
+
+  private async resolve(
     projectId: string,
     sourceMediaId: string,
   ): Promise<DialogueResolution> {
@@ -265,15 +301,12 @@ export class DialogueService {
       return { state: "failed", dialogue: null, details: "save_failed" };
     }
 
-    // The superseded dialogue is dropped only once the new one is stored.
-    const stale =
-      previous ??
-      (await this.dialogues
-        .getByProjectAndSource(dialogue.projectId, dialogue.sourceMediaId)
-        .catch(() => null));
-
-    if (stale && stale.id !== dialogue.id) {
-      await this.dialogues.delete(stale.id).catch(() => {
+    // The superseded dialogue is dropped only once the new one is stored, and
+    // only the record this call actually decided to replace. Looking the
+    // "current" one up again here would let a concurrent generation delete a
+    // sibling it never examined.
+    if (previous && previous.id !== dialogue.id) {
+      await this.dialogues.delete(previous.id).catch(() => {
         // An orphaned old dialogue is harmless; the new one is active.
       });
     }

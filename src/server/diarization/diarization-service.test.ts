@@ -49,6 +49,7 @@ function job(overrides: Partial<ProcessingJob> = {}): ProcessingJob {
     providerId: "mock",
     languageHint: null,
     audioArtifactId: null,
+    parameters: null,
     ...overrides,
   };
 }

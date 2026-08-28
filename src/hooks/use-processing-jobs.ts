@@ -6,7 +6,9 @@ import type { ProjectMedia } from "@/types/media";
 import type { Project } from "@/types/project";
 import {
   isTerminalStatus,
+  jobTypeNeedsSourceMedia,
   type ProcessingJob,
+  type ProcessingJobParameters,
   type ProcessingJobType,
 } from "@/types/processing-job";
 import {
@@ -33,7 +35,10 @@ export interface UseProcessingJobsResult {
   error: string | null;
   capabilities: ProcessingCapabilitiesState | null;
   pendingType: ProcessingJobType | null;
-  startJob: (type: ProcessingJobType) => Promise<boolean>;
+  startJob: (
+    type: ProcessingJobType,
+    parameters?: ProcessingJobParameters,
+  ) => Promise<boolean>;
   cancelJob: (jobId: string) => Promise<void>;
   clearError: () => void;
   artifactUrl: (artifactId: string) => string;
@@ -170,7 +175,7 @@ export function useProcessingJobs(
   }, [projectId, activeJobKey, client]);
 
   const startJob = useCallback(
-    async (type: ProcessingJobType) => {
+    async (type: ProcessingJobType, parameters?: ProcessingJobParameters) => {
       if (!project || !media || pendingRef.current) {
         return false;
       }
@@ -180,20 +185,27 @@ export function useProcessingJobs(
       setError(null);
 
       try {
-        // Development transport: hand the browser-held source to the backend.
-        const source = await mediaService.getPlayableSource(media.id);
+        // Development transport: hand the browser-held source to the backend —
+        // but only for the stages that actually consume it. Translation reads
+        // the dialogue the backend already stores, so it uploads nothing.
+        let source: Blob | undefined;
 
-        if (!source) {
-          setError(
-            "The stored source video is unavailable, so it cannot be processed.",
-          );
-          return false;
+        if (jobTypeNeedsSourceMedia(type)) {
+          source = (await mediaService.getPlayableSource(media.id)) ?? undefined;
+
+          if (!source) {
+            setError(
+              "The stored source video is unavailable, so it cannot be processed.",
+            );
+            return false;
+          }
         }
 
         const job = await client.createJob({
           projectId: project.id,
           sourceMediaId: media.id,
           type,
+          parameters,
           source,
           sourceFilename: media.filename,
         });

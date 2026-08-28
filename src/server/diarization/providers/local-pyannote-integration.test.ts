@@ -80,6 +80,7 @@ const job: ProcessingJob = {
   providerId: "local-pyannote",
   languageHint: null,
   audioArtifactId: null,
+  parameters: null,
 };
 
 describe.skipIf(!modelsPresent || !fixturePresent)(

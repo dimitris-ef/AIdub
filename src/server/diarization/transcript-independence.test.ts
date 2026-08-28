@@ -63,6 +63,7 @@ function job(type: ProcessingJob["type"], providerId: string): ProcessingJob {
     providerId,
     languageHint: "en",
     audioArtifactId: null,
+    parameters: null,
   };
 }
 

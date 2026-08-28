@@ -29,6 +29,7 @@ const job = (overrides: Partial<ProcessingJob> = {}): ProcessingJob => ({
   providerId: null,
   languageHint: null,
   audioArtifactId: null,
+  parameters: null,
   ...overrides,
 });
 

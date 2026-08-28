@@ -45,6 +45,17 @@ export function ProcessingJobResultDetails({
     );
   }
 
+  if (result.kind === "translate") {
+    return (
+      <p className="text-xs text-muted-foreground">
+        {result.segmentCount} translated{" "}
+        {result.segmentCount === 1 ? "line" : "lines"} ·{" "}
+        {result.sourceLanguage} → {result.targetLanguage} ·{" "}
+        {result.providerModel ?? result.providerId}
+      </p>
+    );
+  }
+
   const { artifact } = result;
   const parts = [
     "WAV",

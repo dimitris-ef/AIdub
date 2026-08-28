@@ -118,6 +118,28 @@ Non-negotiables for new work:
   never overwrite the dialogue — surface the stale baseline instead.
 - Playback time stays out of React state; transcript rows must not re-render on
   every frame.
+- Translation consumes the **current editable `UnifiedDialogue`**, never the raw
+  Part 5 transcript, and never writes to the dialogue, transcript or
+  diarization. `originalText` is never overwritten by a translation.
+- Translation providers live behind `TranslationProvider` in
+  `src/server/translation/`; prompts, model names, credentials, payload shapes
+  and per-provider retries never leak into the translation model or any
+  component. The default comes from `AIDUB_TRANSLATION_PROVIDER`.
+- Translation is a `translate` processing job — never a second AI-job system —
+  and carries no source media: it reads the dialogue the backend already holds.
+- Provider results are matched by stable `dialogueSegmentId`, never by array
+  position. Missing, duplicate, unknown or empty results fail the job; nothing
+  is fabricated to fill a gap.
+- Part 9 translation is segment-preserving and 1:1: speaker ids and timestamps
+  are copied unchanged, order comes from the dialogue, and an empty source line
+  stays a line rather than being dropped or sent to a provider.
+- A translation is valid only for one project, source media, dialogue, dialogue
+  revision and language pair. Editing the dialogue makes it stale — surfaced,
+  never deleted and never presented as current.
+- Usage, provider model and confidence are recorded only where a provider
+  genuinely reports them; an unmeasured value stays absent rather than zero.
+- Dubbing adaptation — shortening, expansion control, lip-sync phrasing, scene
+  context, alternate takes, timing fit — belongs to Part 10, not Part 9.
 - Never fabricate confidence: unusable provider values become `null` and stay
   in `providerMetadata`.
 - Run `npm run lint`, `npm run typecheck`, `npm test` and `npm run build` before

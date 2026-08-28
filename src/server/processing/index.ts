@@ -8,9 +8,11 @@ import { ProcessingService } from "@/server/processing/processing-service";
 import { LocalTemporaryFileManager } from "@/server/processing/temporary-file-manager";
 import { TranscriptionService } from "@/server/transcription/transcription-service";
 import { DiarizationService } from "@/server/diarization/diarization-service";
+import { TranslationService } from "@/server/translation/translation-service";
 import { transcriptRepository } from "@/data/transcripts";
 import { diarizationRepository } from "@/data/diarization";
 import { dialogueRepository } from "@/data/dialogue";
+import { translationRepository } from "@/data/translations";
 
 /**
  * Server-side wiring. `server-only` keeps this module — and everything it
@@ -35,12 +37,16 @@ function createProcessingService(): ProcessingService {
     temporaryFiles: new LocalTemporaryFileManager(),
     artifacts: new DevelopmentArtifactStorage(),
     mediaSource: new UploadedProcessingMediaSource(),
-    // Two independent provider-driven stages sharing one job architecture.
+    // Independent provider-driven stages sharing one job architecture.
+    // Transcription and diarization consume the canonical audio; translation
+    // consumes the stored dialogue and no media at all.
     transcription: new TranscriptionService(),
     diarization: new DiarizationService(),
+    translation: new TranslationService(),
     transcripts: transcriptRepository,
     diarizations: diarizationRepository,
     dialogues: dialogueRepository,
+    translations: translationRepository,
   });
 }
 

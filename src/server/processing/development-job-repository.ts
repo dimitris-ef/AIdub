@@ -64,6 +64,7 @@ export class InMemoryProcessingJobRepository
       providerId: input.providerId ?? null,
       languageHint: input.languageHint ?? null,
       audioArtifactId: null,
+      parameters: input.parameters ?? null,
     };
 
     this.jobs.set(job.id, job);

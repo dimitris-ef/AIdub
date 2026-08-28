@@ -25,6 +25,7 @@ const job: ProcessingJob = {
   providerId: null,
   languageHint: null,
   audioArtifactId: null,
+  parameters: null,
 };
 
 function mockFetch(
@@ -70,7 +71,7 @@ describe("parseProcessingJob", () => {
   it.each([
     ["null", null],
     ["a missing id", { ...job, id: undefined }],
-    ["an unknown type", { ...job, type: "translate" }],
+    ["an unknown type", { ...job, type: "render_dub" }],
     ["an unknown status", { ...job, status: "paused" }],
     ["a non-numeric progress", { ...job, progress: "42" }],
   ])("rejects %s", (_label, value) => {

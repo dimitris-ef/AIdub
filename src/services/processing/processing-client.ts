@@ -2,6 +2,7 @@ import {
   isProcessingJobStatus,
   isProcessingJobType,
   type ProcessingJob,
+  type ProcessingJobParameters,
   type ProcessingJobType,
 } from "@/types/processing-job";
 
@@ -22,13 +23,19 @@ export interface CreateProcessingJobRequest {
   providerId?: string;
   /** Source-language hint for providers that accept one. */
   language?: string | null;
+  /** Job-type-specific inputs, for types that need more than a source. */
+  parameters?: ProcessingJobParameters | null;
   /**
    * Development transport: the browser holds the source bytes (Part 3), so it
    * hands them to the backend with the request. Production drops this and lets
    * the backend resolve `sourceMediaId` from object storage.
+   *
+   * Omitted entirely by job types that do not consume the media — translation
+   * works from the dialogue the backend already stores, so uploading the video
+   * for it would be pure waste.
    */
-  source: Blob;
-  sourceFilename: string;
+  source?: Blob;
+  sourceFilename?: string;
   signal?: AbortSignal;
 }
 
@@ -94,6 +101,7 @@ export function parseProcessingJob(value: unknown): ProcessingJob {
     providerId: job.providerId ?? null,
     languageHint: job.languageHint ?? null,
     audioArtifactId: job.audioArtifactId ?? null,
+    parameters: job.parameters ?? null,
     startedAt: job.startedAt ?? null,
     completedAt: job.completedAt ?? null,
     error: job.error ?? null,
@@ -128,6 +136,7 @@ export class HttpProcessingClient implements ProcessingClient {
     type,
     providerId,
     language,
+    parameters,
     source,
     sourceFilename,
     signal,
@@ -136,13 +145,18 @@ export class HttpProcessingClient implements ProcessingClient {
     form.set("projectId", projectId);
     form.set("sourceMediaId", sourceMediaId);
     form.set("type", type);
-    form.set("source", source, sourceFilename);
 
+    if (source) {
+      form.set("source", source, sourceFilename);
+    }
     if (providerId) {
       form.set("providerId", providerId);
     }
     if (language) {
       form.set("language", language);
+    }
+    if (parameters) {
+      form.set("parameters", JSON.stringify(parameters));
     }
 
     const response = await fetch(`${this.baseUrl}/jobs`, {

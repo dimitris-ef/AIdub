@@ -1734,17 +1734,314 @@ assignment, no source separation, no automatic timing alignment or TTS duration
 fitting, and no dubbing, mixing or export. It corrects the original-language
 dialogue; it does not generate anything.
 
+## Part 9: Translation Provider System
+
+Part 8 produced a dialogue a person has corrected. Part 9 answers one question
+about it — **what is the translated text for each existing dialogue segment?**
+— and nothing more. It is the provider-independent foundation Part 10's
+dubbing-aware translation is built on, not that translation itself.
+
+### Translation architecture
+
+```
+Current editable UnifiedDialogue   (Parts 7–8, corrections included)
+        ↓
+ProcessingJob  type: "translate"   (the same job system as every other stage)
+        ↓
+TranslationService                 (resolve, validate, batch, verify, persist)
+        ↓
+TranslationProvider                (the only thing that knows a vendor)
+        ↓
+Normalized TranslationProviderResult
+        ↓
+TranslationRepository              (DialogueTranslation, stored separately)
+```
+
+Each layer is replaceable without touching the ones above it. The Translate
+workspace knows nothing about API payloads, prompts, model names,
+authentication, batching, or whether translation runs locally, in a hosted API,
+or on an external worker.
+
+### The input is the corrected dialogue, never raw STT
+
+This is the rule the rest of Part 9 depends on. `TranslationService` resolves
+the current dialogue through `DialogueService` — the same document the
+Transcript workspace shows — and builds its request from that. So a line whose
+text was rewritten, whose speaker was reassigned, whose timing was corrected, or
+which was split or merged in Part 8 reaches the provider **as corrected**. The
+raw Part 5 transcript is never read here, and the pipeline is:
+
+```
+Raw STT + raw diarization → UnifiedDialogue → Part 8 corrections
+                                     → current editable dialogue → translation
+```
+
+### Provider abstraction
+
+`TranslationProvider` (`src/server/translation/translation-provider.ts`) is
+deliberately not HTTP-shaped, so one abstraction covers hosted machine
+translation APIs, LLM providers, self-hosted models and external workers:
+
+```ts
+interface TranslationProvider {
+  readonly id: string;
+  readonly displayName: string;
+  readonly capabilities: TranslationProviderCapabilities;
+  isAvailable(): Promise<boolean>;
+  translate(
+    request: TranslationRequest,
+    context?: TranslationProviderContext,
+  ): Promise<TranslationProviderResult>;
+}
+```
+
+`capabilities` (batching, context, glossary, confidence, usage) exists so the
+service can adapt without hard-coding provider knowledge — a provider that
+cannot batch is simply driven one line at a time.
+
+Two providers ship:
+
+- **`openai-compatible`** (the default) — real translation through any
+  OpenAI-compatible `POST /chat/completions` endpoint, which covers OpenAI and
+  Azure OpenAI, gateways such as OpenRouter, and self-hosted servers that copy
+  the shape (vLLM, Ollama, LM Studio, llama.cpp, TGI). Hosted API and
+  self-hosted model are the same adapter and a different base URL. It requires
+  `AIDUB_TRANSLATION_API_KEY`; without it the provider reports itself
+  unavailable and the job fails with one clear message rather than part way
+  through.
+- **`mock`** — a deterministic test double returning `[<target>] <source>`. It
+  is only registered when `AIDUB_TRANSLATION_PROVIDER=mock` names it
+  explicitly, so a misconfigured deployment fails loudly instead of quietly
+  shipping placeholder subtitles.
+
+Configuration is centralised — `AIDUB_TRANSLATION_PROVIDER`,
+`AIDUB_TRANSLATION_BASE_URL`, `AIDUB_TRANSLATION_MODEL`,
+`AIDUB_TRANSLATION_BATCH_SIZE`, `AIDUB_TRANSLATION_TIMEOUT_MS` — so a future
+Settings screen changes the provider by writing one value.
+
+### Translation request contract
+
+```ts
+interface TranslationRequest {
+  projectId: string;
+  sourceMediaId: string;
+  dialogueId: string;
+  dialogueRevision: number;
+  sourceLanguage: string;
+  targetLanguage: string;
+  segments: {
+    segmentId: string;      // the stable dialogue segment id
+    speakerId: string | null;
+    startTime: number;      // numeric seconds
+    endTime: number;
+    sourceText: string;     // the corrected dialogue text
+  }[];
+}
+```
+
+The language pair is always explicit, taken from `project.sourceLanguage` and
+`project.targetLanguage`. A provider is never left to infer the target.
+
+### Structured output, never guessed
+
+An LLM provider sends each line as an object carrying its segment id and
+requires JSON back keyed by the same ids. Aidub never sends several lines as one
+paragraph and then tries to split the answer — there is no reliable way to do
+that, and a wrong split silently misattributes dialogue.
+
+Provider answers are matched **by segment id, never by array position**
+(`src/lib/translation/validate-translation.ts`). Four contract violations fail
+the job rather than being repaired:
+
+| Violation | Code |
+| --- | --- |
+| A requested line is missing | `TRANSLATION_INCOMPLETE_RESPONSE` |
+| A line comes back twice | `TRANSLATION_DUPLICATE_SEGMENT` |
+| A line was never requested | `TRANSLATION_UNKNOWN_SEGMENT` |
+| A line with text comes back empty | `TRANSLATION_EMPTY_RESULT` |
+
+Nothing is fabricated to fill a gap: a translation with a silently blank or
+wrong line is worse than none, because it looks finished.
+
+### Translation data model
+
+```ts
+interface DialogueTranslation {
+  id: string;
+  projectId: string;
+  sourceMediaId: string;
+  dialogueId: string;
+  dialogueRevision: number;   // the exact revision translated
+  sourceLanguage: string;
+  targetLanguage: string;
+  providerId: string;
+  providerModel: string | null;
+  version: number;            // storage schema version
+  status: "processing" | "completed" | "failed";
+  segments: TranslatedDialogueSegment[];
+  createdAt: string;
+  updatedAt: string;
+  providerMetadata?: Record<string, unknown>;
+  usage?: TranslationUsage | null;
+}
+```
+
+```ts
+interface TranslatedDialogueSegment {
+  id: string;                 // this record's own identity
+  dialogueSegmentId: string;  // the relationship everything joins on
+  speakerId: string | null;   // copied from the dialogue
+  startTime: number;          // copied from the dialogue
+  endTime: number;
+  sourceText: string;         // snapshot of what was translated
+  translatedText: string;
+  sourceLanguage: string;
+  targetLanguage: string;
+  confidence: number | null;
+  providerMetadata?: Record<string, unknown>;
+}
+```
+
+### Separation from the source dialogue
+
+`DialogueSegment.originalText` is **never** overwritten. Translated text lives
+only in `TranslatedDialogueSegment.translatedText`, in a separate record, in a
+separate store. Both languages are available simultaneously, which is what voice
+assignment, TTS, timing and export need. Translation also never writes to the
+dialogue, the transcript or the diarization — the service holds no reference to
+those stores at all, and a test snapshots all three across a full translation to
+prove it.
+
+Structure is 1:1 and comes from the dialogue, not the provider: output order is
+the dialogue's timeline order whatever order the provider answered in, and a
+line with empty source text is preserved as an empty translated line rather than
+dropped — and is never sent to a provider, which would spend credits to invite a
+model to invent dialogue.
+
+### Staleness
+
+A translation is valid only for the exact tuple:
+
+```
+projectId + sourceMediaId + dialogueId + dialogueRevision
+          + sourceLanguage + targetLanguage
+```
+
+Part 8 bumps the dialogue revision on every persisted correction, so any edit —
+text, speaker, timing, split or merge — makes the whole translation stale. That
+is coarse on purpose: Part 9 stores each line's source text, speaker and timing
+precisely so a later part can determine *which* lines changed and retranslate
+only those. Guessing at partial validity now risks presenting text translated
+from a sentence the user has since rewritten.
+
+**Stale never means deleted.** The translation stays stored and stays findable —
+switching the target language back, or undoing an edit, finds it again — it is
+simply presented as out of date, with a `Retranslate` action. Changing the
+default provider does *not* invalidate anything: each translation records the
+provider that made it.
+
+### Processing jobs
+
+Translation is a `translate` processing job — the same lifecycle, progress,
+cancellation and error model as every other stage, not a second job system. Two
+things are new:
+
+- **Job parameters.** `ProcessingJob.parameters` is a typed, discriminated
+  union carrying the dialogue id, dialogue revision and language pair. Later
+  stages that need their own inputs extend it rather than adding nullable
+  scalars to every job.
+- **Media-free jobs.** Translation reads the stored dialogue, so a translate job
+  carries **no source video at all** — no upload, no temp file, no FFmpeg. The
+  request path, the service and the client all branch on
+  `jobTypeNeedsSourceMedia`, and a media-free stage's `ensureAudio` throws, so
+  it cannot quietly start depending on media its job never carried.
+
+Progress is real, not fabricated: the service batches the dialogue itself
+(`AIDUB_TRANSLATION_BATCH_SIZE`, default 20) and reports completed lines over
+total lines — "Translating 14 of 52 lines". Cancellation is checked between
+batches as well as inside them, so a cancelled job stops before spending another
+provider call, and a result that arrives after cancellation is discarded rather
+than saved.
+
+Timeout policy is **per provider request**, not per project: a long dialogue
+legitimately takes many minutes, and a whole-job ceiling would either be
+uselessly large or would kill healthy long translations.
+
+Retry creates a **new job**; a failed job stays failed and historical. A retry
+uses the dialogue's current revision, so retrying after an edit translates what
+is actually there now.
+
+### Provider metadata, usage and confidence
+
+`providerId` and `providerModel` are persisted on every translation; vendor
+detail goes in `providerMetadata` and never becomes a core field. Usage is
+normalised (`TranslationUsage`) and summed across batches, with absent
+measurements staying absent — a provider that reports nothing gets
+`usage: null`, never zeros, because zero reads as "this cost nothing" rather
+than "this was never measured". Part 9 records usage; it does not price it.
+
+Confidence is `null` unless a provider reports something genuinely comparable in
+0–1. Most translation providers, LLMs included, do not.
+
+### Credentials
+
+Provider credentials are read from the server environment inside the adapter and
+go nowhere else: never into a `NEXT_PUBLIC_*` variable, a client bundle, a
+persisted translation, provider metadata returned to the frontend, or a log
+line. Logs carry identifiers, counts, language codes and usage totals — never
+dialogue text or translated text.
+
+### Production architecture
+
+```
+Vercel Aidub web app
+    → processing/job coordinator
+        → external translation worker or provider API
+            → TranslationProvider
+                → translation persistence
+```
+
+Vercel remains the web host. Nothing assumes a self-hosted translation model
+runs inside a Vercel function; `TranslationService` takes a job context and a
+repository, so running it on an external worker is a deployment change, not a
+rewrite.
+
+### Translate workspace
+
+`/projects/[projectId]/translate` shows the prerequisite state, the language
+pair and dialogue line count, the `Translate` action, live job
+progress/stage/cancel, normalised errors with `Retry`, and a read-only preview
+pairing each original line with its translation. Speaker names are resolved from
+the **current dialogue**, so renaming a speaker in the Transcript editor shows
+through immediately instead of leaving a stale copy behind.
+
+A project whose source and target languages match is blocked with an
+explanation rather than translated — spending provider credits to reproduce text
+we already have is not a useful default.
+
+### Explicit non-goals
+
+Part 9 implements **no** dubbing adaptation of any kind: no shortening or
+expansion to fit a take, no lip-sync-aware phrasing, no syllable or duration
+fitting, no scene or neighbouring-line context, no character-voice consistency,
+no alternate translations, no cultural or politeness adaptation. It also has no
+translation editing, no TTS, no voice cloning, no timing alignment, no source
+separation and no mixing or export. The completed translation is read-only.
+Those belong to Part 10 and later, and are exactly what this provider and data
+layer exists to support.
+
 ## Not implemented (on purpose)
 
 Authentication, accounts, billing, a production database, cloud media storage,
 transcoding for delivery, proxy or thumbnail generation, waveform generation,
-real queues and external workers, source separation, LLM/translation
-integration, TTS, voice cloning, speaker naming or identity recognition,
-the dubbing/mixing timeline, export/render processing, analytics and
-collaboration are all still out of scope. Part 8 stops at reviewed dialogue:
-who said what and when can now be corrected by hand, and nothing is translated,
-synthesised, aligned or mixed. There are no placeholder or mock API routes for
-those features. Project and media persistence exist only in the temporary
+real queues and external workers, source separation, TTS, voice cloning,
+speaker naming or identity recognition, translation editing, dubbing-aware
+translation adaptation, timing alignment, the dubbing/mixing timeline,
+export/render processing, analytics and collaboration are all still out of
+scope. Part 9 stops at translated text: each corrected dialogue line now has a
+target-language counterpart stored beside it, and nothing is synthesised,
+aligned or mixed. There are no placeholder or mock API routes for those
+features. Project and media persistence exist only in the temporary
 browser-local forms described above.
 
 ## Architectural decisions later parts must preserve
@@ -1954,3 +2251,40 @@ Part 8 adds:
 102. Dialogue editing persistence stays behind repository/service abstractions,
      and Vercel remains the web host while heavy processing stays
      external-worker-ready.
+
+Part 9 adds:
+
+103. Translation consumes the **current editable unified dialogue**; once a
+     dialogue exists, raw STT is never translated directly.
+104. `DialogueSegment.originalText` is never overwritten by a translation;
+     translated text is persisted in a separate record and store.
+105. Every translated segment references a stable `dialogueSegmentId`, and
+     never an array position.
+106. Speaker ids and timestamps are copied from the dialogue unchanged;
+     translation never assigns a speaker or adjusts timing.
+107. Segment structure stays **1:1** in Part 9 — no splitting, merging,
+     reordering or dropping, including for empty source lines.
+108. Providers implement `TranslationProvider`; vendor payloads, prompts,
+     model names, credentials and retries never become the core model.
+109. Provider results are matched by segment id and validated before
+     persistence; missing, duplicate, unknown or empty results fail the job
+     rather than producing a partial translation.
+110. A translation is bound to project, source media, dialogue, dialogue
+     revision and language pair; anything else makes it stale, not deleted.
+111. Editing the dialogue makes existing translations stale; changing the
+     default provider does not.
+112. Translation runs as a `translate` processing job in the shared job
+     architecture — never a second job system — and carries no source media.
+113. Failed translations are retried through **new** jobs; a cancelled job
+     never persists a completed translation.
+114. Provider metadata, usage and confidence are optional and never
+     fabricated; an unmeasured value stays absent.
+115. Provider credentials stay backend/worker-only and never reach the
+     browser, a stored translation or a log line.
+116. Translation persistence stays behind `TranslationRepository`, with a key
+     space that supports several target languages per dialogue.
+117. Vercel remains the web host; translation must stay movable to an external
+     worker without changing the Translate UI.
+118. Part 10 builds dubbing-aware translation **on top of** this provider and
+     data layer; TTS, timing, mix and export consume translations without
+     modifying the source dialogue.

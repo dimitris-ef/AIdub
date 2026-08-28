@@ -74,7 +74,14 @@ Dialogue editing is real as of Part 8: the same client applies corrections
 through `PATCH /api/dialogue`, which derives, validates and persists a new
 document server-side. Raw STT and diarization are never touched.
 
-Still absent: source separation, translation, speech synthesis, timing
+Translation is real as of Part 9: `translation/translation-client.ts` reads the
+stored translation for a dialogue revision and language pair, produced by a
+`translate` job the same processing client creates. Providers, prompts,
+credentials and batching stay in `src/server/translation/`, and the translated
+text is persisted separately from the dialogue it came from — both languages
+stay available at once.
+
+Still absent: source separation, speech synthesis, voice cloning, timing
 alignment and rendering — with no mock stand-ins. Those stages consume the
-edited unified dialogue and processing artifacts through this same
-architecture.
+edited unified dialogue, its translation and processing artifacts through this
+same architecture.

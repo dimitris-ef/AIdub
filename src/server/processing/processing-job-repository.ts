@@ -6,6 +6,7 @@ import {
   isTerminalStatus,
   type ProcessingJob,
   type ProcessingJobError,
+  type ProcessingJobParameters,
   type ProcessingJobResult,
   type ProcessingJobStatus,
   type ProcessingJobType,
@@ -25,6 +26,8 @@ export interface CreateProcessingJobInput {
   providerId?: string | null;
   /** Optional source-language hint passed to the provider. */
   languageHint?: string | null;
+  /** Job-type-specific inputs, for types that need more than a source. */
+  parameters?: ProcessingJobParameters | null;
 }
 
 export interface UpdateProcessingJobInput {

@@ -1,11 +1,16 @@
 import type { NextRequest } from "next/server";
 
+import {
+  isProcessingJobType,
+  jobTypeNeedsSourceMedia,
+} from "@/types/processing-job";
 import { processingService } from "@/server/processing";
 import { ProcessingError } from "@/server/processing/processing-errors";
 import {
   MAX_UPLOAD_BYTES,
   errorResponse,
   jobResponse,
+  parseJobParameters,
   readRequiredParam,
 } from "@/app/api/processing/_shared";
 
@@ -52,7 +57,11 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  if (!(source instanceof File) || source.size === 0) {
+  // Only the stages that consume the video carry it. A translation works from
+  // the stored dialogue, so it arrives without a `source` part at all.
+  const needsMedia = !isProcessingJobType(type) || jobTypeNeedsSourceMedia(type);
+
+  if (needsMedia && (!(source instanceof File) || source.size === 0)) {
     return errorResponse(
       "SOURCE_MEDIA_NOT_FOUND",
       "The source media could not be read for processing.",
@@ -60,7 +69,7 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  if (source.size > MAX_UPLOAD_BYTES) {
+  if (source instanceof File && source.size > MAX_UPLOAD_BYTES) {
     return errorResponse(
       "INVALID_REQUEST",
       "This video is too large for development processing.",
@@ -68,24 +77,31 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  const parameters = parseJobParameters(form.get("parameters"));
+
   try {
-    const bytes = new Uint8Array(await source.arrayBuffer());
+    const uploadedSource =
+      source instanceof File && source.size > 0
+        ? {
+            bytes: new Uint8Array(await source.arrayBuffer()),
+            filename: source.name,
+          }
+        : undefined;
+
     const job = await processingService.createJob({
       projectId,
       sourceMediaId,
       type,
       providerId,
       languageHint,
-      uploadedSource: { bytes, filename: source.name },
+      parameters,
+      uploadedSource,
     });
 
     // Development execution: run in this process and let the client poll.
     // A queue implementation would enqueue here instead; the response is the
     // same queued job either way.
-    void processingService.runJob(job.id, {
-      bytes,
-      filename: source.name,
-    });
+    void processingService.runJob(job.id, uploadedSource);
 
     return jobResponse(job, 201);
   } catch (cause) {

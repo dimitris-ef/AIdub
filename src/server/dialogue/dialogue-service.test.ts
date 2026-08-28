@@ -227,6 +227,42 @@ describe("DialogueService", () => {
       await diarizations.save(diarization());
     });
 
+    it("gives concurrent readers the same dialogue", async () => {
+      // Two parts of the workspace can ask at once — Transcript and Translate
+      // both need the dialogue. Two generations would each mint an id and then
+      // delete what each took to be the superseded record, leaving a caller
+      // holding an id that no longer exists.
+      const service = createService();
+      const [first, second, third] = await Promise.all([
+        service.getCurrentDialogue(PROJECT, MEDIA),
+        service.getCurrentDialogue(PROJECT, MEDIA),
+        service.getCurrentDialogue(PROJECT, MEDIA),
+      ]);
+
+      expect(first.dialogue?.id).toBeDefined();
+      expect(second.dialogue?.id).toBe(first.dialogue?.id);
+      expect(third.dialogue?.id).toBe(first.dialogue?.id);
+
+      // And exactly one record was persisted, not three racing siblings.
+      expect(await dialogues.listByProject(PROJECT)).toHaveLength(1);
+    });
+
+    it("still serves the stored dialogue after a concurrent first read", async () => {
+      const service = createService();
+      await Promise.all([
+        service.getCurrentDialogue(PROJECT, MEDIA),
+        service.getCurrentDialogue(PROJECT, MEDIA),
+      ]);
+
+      const later = await service.getCurrentDialogue(PROJECT, MEDIA);
+
+      expect(later.state).toBe("ready");
+      expect(later.state === "ready" && later.regenerated).toBe(false);
+      expect(
+        await dialogues.getByProjectAndSource(PROJECT, MEDIA),
+      ).not.toBeNull();
+    });
+
     it("generates, persists and references the exact raw inputs", async () => {
       const result = await createService().getCurrentDialogue(PROJECT, MEDIA);
 

@@ -2,6 +2,10 @@ import "server-only";
 
 import type { ProcessingErrorCode, ProcessingJob } from "@/types/processing-job";
 
+// Re-exported so route handlers keep one import for request helpers; the
+// parsing itself is a pure library function, and therefore directly testable.
+export { parseJobParameters } from "@/lib/processing/job-parameters";
+
 /**
  * Shared helpers for the processing API. The `_shared` folder name keeps this
  * out of the route table.

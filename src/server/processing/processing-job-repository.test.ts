@@ -29,6 +29,7 @@ const baseJob: ProcessingJob = {
   providerId: null,
   languageHint: null,
   audioArtifactId: null,
+  parameters: null,
 };
 
 describe("job status transitions", () => {

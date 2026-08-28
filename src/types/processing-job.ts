@@ -13,6 +13,7 @@ export const PROCESSING_JOB_TYPES = [
   "convert_media",
   "transcribe",
   "diarize",
+  "translate",
 ] as const;
 
 export type ProcessingJobType = (typeof PROCESSING_JOB_TYPES)[number];
@@ -64,6 +65,22 @@ export const PROCESSING_ERROR_CODES = [
   "DIARIZATION_UNSUPPORTED_AUDIO",
   "DIARIZATION_SAVE_FAILED",
   "DIARIZATION_CANCELLED",
+  "TRANSLATION_PROVIDER_UNAVAILABLE",
+  "TRANSLATION_AUTHENTICATION_FAILED",
+  "TRANSLATION_REQUEST_FAILED",
+  "TRANSLATION_RATE_LIMITED",
+  "TRANSLATION_TIMEOUT",
+  "TRANSLATION_INVALID_RESPONSE",
+  "TRANSLATION_INCOMPLETE_RESPONSE",
+  "TRANSLATION_DUPLICATE_SEGMENT",
+  "TRANSLATION_UNKNOWN_SEGMENT",
+  "TRANSLATION_EMPTY_RESULT",
+  "TRANSLATION_SAVE_FAILED",
+  "TRANSLATION_SOURCE_CHANGED",
+  "TRANSLATION_SOURCE_REQUIRED",
+  "TRANSLATION_SAME_LANGUAGE",
+  "TRANSLATION_UNSUPPORTED_LANGUAGE",
+  "TRANSLATION_CANCELLED",
   "AUDIO_EXTRACTION_FAILED",
   "CONVERSION_FAILED",
   "TEMP_STORAGE_ERROR",
@@ -143,13 +160,59 @@ export interface DiarizationJobResult {
   providerModel: string | null;
 }
 
+/**
+ * Translation references the saved translation rather than repeating it: the
+ * translated lines are persisted in their own store and outlive the job.
+ */
+export interface TranslateJobResult {
+  kind: "translate";
+  translationId: string;
+  dialogueId: string;
+  dialogueRevision: number;
+  segmentCount: number;
+  sourceLanguage: string;
+  targetLanguage: string;
+  providerId: string;
+  providerModel: string | null;
+}
+
 export type ProcessingJobResult =
   | ProbeJobResult
   | ExtractAudioJobResult
   | ConvertMediaJobResult
   | TranscribeJobResult
   | DiarizationJobResult
+  | TranslateJobResult
   | null;
+
+/**
+ * Job-type-specific inputs that project and source media alone cannot express.
+ *
+ * A discriminated union rather than a widening list of nullable scalars on the
+ * job: a translation needs to name a dialogue revision and a language pair,
+ * and later stages will need their own inputs (a voice assignment, a mix
+ * preset) without every job type growing fields it ignores.
+ */
+export interface TranslateJobParameters {
+  kind: "translate";
+  /** The exact dialogue the job was created against. */
+  dialogueId: string;
+  /** The exact `editMetadata.revision` of that dialogue. */
+  dialogueRevision: number;
+  sourceLanguage: string;
+  targetLanguage: string;
+}
+
+export type ProcessingJobParameters = TranslateJobParameters;
+
+/**
+ * Job types that consume the source media itself. Everything else works from
+ * data the backend already holds — a translation reads the stored dialogue, so
+ * it neither needs nor accepts a video upload.
+ */
+export function jobTypeNeedsSourceMedia(type: ProcessingJobType): boolean {
+  return type !== "translate";
+}
 
 export interface ProcessingJob {
   id: string;
@@ -175,6 +238,8 @@ export interface ProcessingJob {
   languageHint: string | null;
   /** The generated audio a job consumed, once it is known. */
   audioArtifactId: string | null;
+  /** Job-type-specific inputs; null for types that need none. */
+  parameters: ProcessingJobParameters | null;
 }
 
 /**

@@ -6,8 +6,10 @@ import {
   PROGRESS_STARTED,
   isProcessingJobType,
   isTerminalStatus,
+  jobTypeNeedsSourceMedia,
   type ProbeMediaResult,
   type ProcessingJob,
+  type ProcessingJobParameters,
   type ProcessingJobType,
 } from "@/types/processing-job";
 import {
@@ -28,6 +30,7 @@ import type { ProcessingArtifactStorage } from "@/server/artifacts/processing-ar
 import type { TranscriptRepository } from "@/data/transcripts";
 import type { DiarizationRepository } from "@/data/diarization";
 import type { UnifiedDialogueRepository } from "@/data/dialogue";
+import type { TranslationRepository } from "@/data/translations";
 import type {
   ProcessingMediaSource,
   MaterializeSourceRequest,
@@ -42,7 +45,13 @@ import type {
 export interface StageRunContext {
   job: ProcessingJob;
   signal: AbortSignal;
-  /** Reuses the project's canonical audio, extracting it only if needed. */
+  /**
+   * Reuses the project's canonical audio, extracting it only if needed.
+   *
+   * Stages that work from data the backend already holds — translation reads
+   * the stored dialogue — simply never call this, and their jobs carry no
+   * media at all.
+   */
   ensureAudio: () => Promise<PreparedAudio>;
   onProgress: (progress: number, stage?: string) => void;
 }
@@ -89,6 +98,8 @@ export interface CreateJobRequest {
   providerId?: string | null;
   /** Optional source-language hint for providers that accept one. */
   languageHint?: string | null;
+  /** Job-type-specific inputs, for types that need more than a source. */
+  parameters?: ProcessingJobParameters | null;
   uploadedSource?: MaterializeSourceRequest["uploadedSource"];
 }
 
@@ -102,12 +113,16 @@ export interface ProcessingServiceOptions {
   transcription?: TranscriptionRunner;
   /** Handles "diarize" jobs; absent means diarization is unavailable. */
   diarization?: DiarizationRunner;
+  /** Handles "translate" jobs; absent means translation is unavailable. */
+  translation?: StageRunner;
   /** Lets project/media cleanup dispose of transcripts too. */
   transcripts?: TranscriptRepository;
   /** Lets project/media cleanup dispose of diarization results too. */
   diarizations?: DiarizationRepository;
   /** Lets project/media cleanup dispose of derived dialogue too. */
   dialogues?: UnifiedDialogueRepository;
+  /** Lets project/media cleanup dispose of translations too. */
+  translations?: TranslationRepository;
   logger?: (message: string, cause?: unknown) => void;
 }
 
@@ -123,9 +138,11 @@ export class ProcessingService {
   private readonly mediaSource: ProcessingMediaSource;
   private readonly transcription?: TranscriptionRunner;
   private readonly diarization?: DiarizationRunner;
+  private readonly translation?: StageRunner;
   private readonly transcripts?: TranscriptRepository;
   private readonly diarizations?: DiarizationRepository;
   private readonly dialogues?: UnifiedDialogueRepository;
+  private readonly translations?: TranslationRepository;
   private readonly logger: (message: string, cause?: unknown) => void;
   /** Live jobs, so they can be aborted. Never exposed to the frontend. */
   private readonly running = new Map<string, AbortController>();
@@ -138,9 +155,11 @@ export class ProcessingService {
     this.mediaSource = options.mediaSource;
     this.transcription = options.transcription;
     this.diarization = options.diarization;
+    this.translation = options.translation;
     this.transcripts = options.transcripts;
     this.diarizations = options.diarizations;
     this.dialogues = options.dialogues;
+    this.translations = options.translations;
     this.logger = options.logger ?? defaultLogger;
   }
 
@@ -161,6 +180,7 @@ export class ProcessingService {
       type,
       providerId: request.providerId ?? null,
       languageHint: request.languageHint ?? null,
+      parameters: request.parameters ?? null,
     });
   }
 
@@ -297,14 +317,19 @@ export class ProcessingService {
       // data that could be mistaken for the new source's analysis.
       await this.transcripts?.deleteByMedia(projectId, sourceMediaId);
       await this.diarizations?.deleteByMedia(projectId, sourceMediaId);
-      // The dialogue is derived from both, so it goes with them.
+      // The dialogue is derived from both, so it goes with them — and the
+      // translations are derived from the dialogue, so they go too. A
+      // translation of a source that no longer exists could never be current
+      // again, and leaving it would let it be mistaken for the new source's.
       await this.dialogues?.deleteByMedia(projectId, sourceMediaId);
+      await this.translations?.deleteByMedia(projectId, sourceMediaId);
     } else {
       await this.artifacts.deleteByProject(projectId);
       await this.repository.deleteByProject(projectId);
       await this.transcripts?.deleteByProject(projectId);
       await this.diarizations?.deleteByProject(projectId);
       await this.dialogues?.deleteByProject(projectId);
+      await this.translations?.deleteByProject(projectId);
     }
 
     return cancelled;
@@ -338,13 +363,25 @@ export class ProcessingService {
         "This processing operation is not supported.",
       );
     }
+    // Only the stages that actually consume the video need its bytes. A
+    // translation reads the stored dialogue, so requiring an upload would mean
+    // shipping a whole video across the network to translate text the backend
+    // already has.
     if (
-      !request.uploadedSource ||
-      request.uploadedSource.bytes.byteLength === 0
+      jobTypeNeedsSourceMedia(request.type) &&
+      (!request.uploadedSource ||
+        request.uploadedSource.bytes.byteLength === 0)
     ) {
       throw new ProcessingError(
         "SOURCE_MEDIA_NOT_FOUND",
         "The source media could not be read for processing.",
+      );
+    }
+
+    if (request.type === "translate" && !request.parameters) {
+      throw new ProcessingError(
+        "INVALID_REQUEST",
+        "The translation request was incomplete.",
       );
     }
 
@@ -357,6 +394,12 @@ export class ProcessingService {
     signal: AbortSignal,
     source: MaterializeSourceRequest["uploadedSource"],
   ): Promise<ProcessingJob["result"]> {
+    // Stages that never touch the media skip materialising it entirely — no
+    // temp file, no upload, no FFmpeg.
+    if (!jobTypeNeedsSourceMedia(job.type)) {
+      return this.executeWithoutMedia(job, signal);
+    }
+
     const sourcePath = await this.temporaryFiles.createPath(
       job.id,
       backendSourceFilename(source?.filename),
@@ -415,7 +458,50 @@ export class ProcessingService {
 
         return this.runStage(this.diarization, job, sourcePath, signal);
       }
+
+      case "translate": {
+        // Unreachable: media-free types are handled before this switch. Kept
+        // so the exhaustiveness check keeps working as job types are added.
+        return this.executeWithoutMedia(job, signal);
+      }
     }
+  }
+
+  /**
+   * Runs a stage that works from data the backend already holds.
+   *
+   * `ensureAudio` still exists on the context and still throws if called, so a
+   * stage cannot quietly start depending on media that its job never carried.
+   */
+  private executeWithoutMedia(
+    job: ProcessingJob,
+    signal: AbortSignal,
+  ): Promise<ProcessingJob["result"]> {
+    if (job.type !== "translate") {
+      throw new ProcessingError(
+        "UNSUPPORTED_JOB_TYPE",
+        "This processing operation is not supported.",
+      );
+    }
+
+    if (!this.translation) {
+      throw new ProcessingError(
+        "TRANSLATION_PROVIDER_UNAVAILABLE",
+        "Translation is not available on this server.",
+      );
+    }
+
+    return this.translation.run({
+      job,
+      signal,
+      ensureAudio: () => {
+        throw new ProcessingError(
+          "AUDIO_ARTIFACT_MISSING",
+          "This job did not request source media.",
+        );
+      },
+      onProgress: (progress, stage) => this.reportProgress(job.id, progress, stage),
+    });
   }
 
   /**
@@ -433,18 +519,20 @@ export class ProcessingService {
       job,
       signal,
       ensureAudio: () => this.ensureCanonicalAudio(job, sourcePath, signal),
-      onProgress: (progress, stage) => {
-        void this.repository
-          .update(job.id, {
-            progress,
-            indeterminate: false,
-            ...(stage === undefined ? {} : { stage }),
-          })
-          .catch(() => {
-            // A dropped progress tick must never fail the job.
-          });
-      },
+      onProgress: (progress, stage) => this.reportProgress(job.id, progress, stage),
     });
+  }
+
+  private reportProgress(jobId: string, progress: number, stage?: string): void {
+    void this.repository
+      .update(jobId, {
+        progress,
+        indeterminate: false,
+        ...(stage === undefined ? {} : { stage }),
+      })
+      .catch(() => {
+        // A dropped progress tick must never fail the job.
+      });
   }
 
   /**
