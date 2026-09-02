@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
 import {
   Captions,
@@ -10,7 +11,10 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import type { ProcessingJob } from "@/types/processing-job";
+import type {
+  ProcessingJob,
+  TranslationJobOperation,
+} from "@/types/processing-job";
 import { formatLanguagePair, getLanguageLabel } from "@/lib/languages";
 import { workspaceSectionHref } from "@/lib/navigation";
 import { TRANSLATION_STALE_MESSAGES } from "@/lib/translation/translation-staleness";
@@ -19,13 +23,25 @@ import { useDialogue } from "@/hooks/use-dialogue";
 import { useProcessingJobs } from "@/hooks/use-processing-jobs";
 import { useSourceMedia } from "@/hooks/use-source-media";
 import { useTranslation } from "@/hooks/use-translation";
+import { useTranslationEditor } from "@/hooks/use-translation-editor";
+import { useProjectEditor } from "@/components/workspace/project-editor-provider";
 import { useProjectWorkspace } from "@/components/workspace/project-workspace-provider";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { ProcessingErrorMessage } from "@/components/processing/processing-job-status";
 import { StageJobStatus } from "@/components/processing/stage-job-status";
 import { TranslationMessage } from "@/components/translate/translation-empty-state";
-import { TranslationPreview } from "@/components/translate/translation-preview";
+import { TranslateEditor } from "@/components/translate/translate-editor";
 
 /**
  * The Translate section.
@@ -40,8 +56,10 @@ import { TranslationPreview } from "@/components/translate/translation-preview";
  * why this page requires the Transcript step rather than offering to translate
  * a raw transcript: corrections a person made are the thing worth translating.
  *
- * Part 9 keeps the result read-only. Editing translated text, alternate takes,
- * and fitting a line to its original delivery are Part 10.
+ * From Part 10 it is the review editor: translated text is edited here, one
+ * line at a time, and a line can be regenerated or shortened on its own. Every
+ * one of those is an explicit action — nothing regenerates on its own, and
+ * nothing loops trying to hit a duration.
  */
 export function TranslateWorkspace() {
   const { project, isLoading: isProjectLoading } = useProjectWorkspace();
@@ -59,7 +77,7 @@ export function TranslateWorkspace() {
   )?.id;
 
   // The dialogue is what gets translated, and its speaker names are what the
-  // preview resolves ids against.
+  // editor resolves ids against.
   const {
     status: dialogueStatus,
     state: dialogueState,
@@ -86,6 +104,26 @@ export function TranslateWorkspace() {
     revision: `${completedJobId ?? ""}::${dialogue?.editMetadata.revision ?? ""}`,
   });
 
+  // Manual edits are applied server-side and the saved document replaces local
+  // state, so what is on screen is what was actually persisted.
+  const {
+    translation: editable,
+    saveStatus,
+    saveError,
+    savingSegmentId,
+    editSegment,
+    dismissError,
+  } = useTranslationEditor(
+    project?.id ?? null,
+    media?.id ?? null,
+    languages,
+    translation,
+  );
+
+  // Selection is the dialogue's, shared with Transcript and the timeline: one
+  // identity for a line across the whole workspace, never a second mapping.
+  const { selectedSegmentId, selectSegment, seek } = useProjectEditor();
+
   if (isProjectLoading || !project || mediaStatus === "loading") {
     return <TranslateSkeleton />;
   }
@@ -95,13 +133,27 @@ export function TranslateWorkspace() {
   const isPending = pendingType === "translate";
   const isBusy = Boolean(activeJob) || isPending;
 
-  async function handleTranslate() {
+  const stale = translationState === "stale";
+  const activeOperation: TranslationJobOperation | null =
+    (activeJob?.parameters?.kind === "translate"
+      ? activeJob.parameters.operation
+      : null) ?? (isPending ? "full" : null);
+  const activeSegmentId =
+    activeJob?.parameters?.kind === "translate"
+      ? (activeJob.parameters.segmentId ?? null)
+      : null;
+
+  async function startTranslationJob(
+    operation: TranslationJobOperation,
+    segmentId?: string,
+  ) {
     if (!dialogue) {
       return;
     }
 
     const started = await startJob("translate", {
       kind: "translate",
+      operation,
       // The job names the exact dialogue revision it was created for, so a
       // result produced against text that has since changed can be rejected
       // rather than stored as current.
@@ -109,10 +161,31 @@ export function TranslateWorkspace() {
       dialogueRevision: dialogue.editMetadata.revision,
       sourceLanguage,
       targetLanguage,
+      segmentId: segmentId ?? null,
+      // A segment operation refuses to write if someone else's edit landed
+      // while it was running.
+      expectedTranslationRevision:
+        operation === "full" ? null : (editable?.revision ?? null),
     });
 
     if (started) {
-      toast.success("Translation started");
+      toast.success(
+        operation === "full"
+          ? "Translation started"
+          : operation === "shorten_segment"
+            ? "Shortening line"
+            : "Regenerating line",
+      );
+    }
+  }
+
+  function handleSelect(segmentId: string) {
+    selectSegment(segmentId);
+
+    const line = dialogue?.segments.find((segment) => segment.id === segmentId);
+
+    if (line) {
+      seek(line.startTime);
     }
   }
 
@@ -129,19 +202,16 @@ export function TranslateWorkspace() {
                 project.targetLanguage,
               )}
             </span>
-            <Button
-              size="sm"
-              variant={translation ? "outline" : "default"}
-              disabled={isBusy}
-              onClick={() => void handleTranslate()}
-            >
-              <Languages aria-hidden />
-              {isPending
-                ? "Starting…"
-                : translation
-                  ? "Retranslate"
-                  : "Translate"}
-            </Button>
+            <RetranslateButton
+              hasTranslation={Boolean(editable)}
+              manualEdits={
+                editable?.segments.filter((s) => s.editMetadata.manuallyEdited)
+                  .length ?? 0
+              }
+              busy={isBusy}
+              pending={isPending}
+              onConfirm={() => void startTranslationJob("full")}
+            />
           </div>
         ) : null}
       </div>
@@ -193,7 +263,13 @@ export function TranslateWorkspace() {
           {activeJob ? (
             <StageJobStatus
               job={activeJob}
-              title="Translating dialogue"
+              title={
+                activeOperation === "shorten_segment"
+                  ? "Shortening line"
+                  : activeOperation === "regenerate_segment"
+                    ? "Regenerating translation"
+                    : "Translating dialogue"
+              }
               onCancel={() => void cancelJob(activeJob.id)}
             />
           ) : null}
@@ -208,7 +284,16 @@ export function TranslateWorkspace() {
                 size="sm"
                 variant="outline"
                 disabled={isBusy}
-                onClick={() => void handleTranslate()}
+                onClick={() =>
+                  void startTranslationJob(
+                    (latestJob.parameters?.kind === "translate"
+                      ? latestJob.parameters.operation
+                      : "full") ?? "full",
+                    latestJob.parameters?.kind === "translate"
+                      ? (latestJob.parameters.segmentId ?? undefined)
+                      : undefined,
+                  )
+                }
               >
                 <RotateCcw aria-hidden />
                 Try again
@@ -235,8 +320,9 @@ export function TranslateWorkspace() {
               <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
               <span>
                 {staleMessage(staleReason)} This translation was made from
-                revision {translation.dialogueRevision} and is shown as it was —
-                nothing was discarded. Retranslate to bring it up to date.
+                dialogue revision {translation.dialogueRevision} and is shown as
+                it was — nothing was discarded. Retranslate to bring it up to
+                date.
               </span>
             </p>
           ) : null}
@@ -253,10 +339,25 @@ export function TranslateWorkspace() {
                 Try again
               </Button>
             </div>
-          ) : translation ? (
-            <TranslationPreview
-              translation={translation}
+          ) : editable ? (
+            <TranslateEditor
+              translation={editable}
               speakers={dialogue.speakers}
+              selectedSegmentId={selectedSegmentId}
+              stale={stale}
+              saveStatus={saveStatus}
+              saveError={saveError}
+              savingSegmentId={savingSegmentId}
+              activeSegmentId={activeSegmentId}
+              activeOperation={activeOperation}
+              onSelect={handleSelect}
+              onCommitText={(segmentId, text) =>
+                void editSegment(segmentId, text)
+              }
+              onSegmentOperation={(segmentId, operation) =>
+                void startTranslationJob(operation, segmentId)
+              }
+              onDismissError={dismissError}
             />
           ) : activeJob ? null : (
             <TranslationMessage
@@ -267,7 +368,7 @@ export function TranslateWorkspace() {
                 <Button
                   size="sm"
                   disabled={isBusy}
-                  onClick={() => void handleTranslate()}
+                  onClick={() => void startTranslationJob("full")}
                 >
                   <Languages aria-hidden />
                   Translate
@@ -284,6 +385,69 @@ export function TranslateWorkspace() {
         rather than deleting it.
       </p>
     </section>
+  );
+}
+
+/**
+ * Retranslating the whole dialogue replaces every line, including the ones
+ * someone rewrote by hand. That is destructive to real work, so it is confirmed
+ * once — but only when there is actually manual work to lose.
+ */
+function RetranslateButton({
+  hasTranslation,
+  manualEdits,
+  busy,
+  pending,
+  onConfirm,
+}: {
+  hasTranslation: boolean;
+  manualEdits: number;
+  busy: boolean;
+  pending: boolean;
+  onConfirm: () => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const label = pending ? "Starting…" : hasTranslation ? "Retranslate" : "Translate";
+
+  return (
+    <>
+      <Button
+        size="sm"
+        variant={hasTranslation ? "outline" : "default"}
+        disabled={busy}
+        onClick={() => (manualEdits > 0 ? setConfirming(true) : onConfirm())}
+      >
+        <Languages aria-hidden />
+        {label}
+      </Button>
+
+      <AlertDialog open={confirming} onOpenChange={setConfirming}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Replace your edits?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This translation contains {manualEdits}{" "}
+              {manualEdits === 1 ? "line" : "lines"} you edited by hand.
+              Retranslating the full dialogue will replace{" "}
+              {manualEdits === 1 ? "it" : "them"} if the new translation
+              succeeds. If it fails, the current translation stays exactly as it
+              is.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                setConfirming(false);
+                onConfirm();
+              }}
+            >
+              Retranslate everything
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   );
 }
 

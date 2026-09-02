@@ -1,13 +1,20 @@
 import { randomUUID } from "node:crypto";
 
 import type { UnifiedDialogue } from "@/types/dialogue";
-import type { TranslateJobResult } from "@/types/processing-job";
+import { speakerDisplayName } from "@/types/dialogue";
 import type {
-  DialogueTranslation,
-  TranslationIdentity,
-  TranslationRequest,
-  TranslationRequestSegment,
-  TranslationUsage,
+  TranslateJobParameters,
+  TranslateJobResult,
+} from "@/types/processing-job";
+import {
+  DEFAULT_DUBBING_OPTIONS,
+  type DialogueTranslation,
+  type TranslatedDialogueSegment,
+  type TranslationGenerationMode,
+  type TranslationIdentity,
+  type TranslationRequest,
+  type TranslationRequestSegment,
+  type TranslationUsage,
 } from "@/types/translation";
 import { translationRepository } from "@/data/translations";
 import type { TranslationRepository } from "@/data/translations";
@@ -21,11 +28,22 @@ import { buildTranslatedSegments, mergeUsage } from "@/lib/translation/normalize
 import {
   isTranslatableText,
   matchProviderResults,
+  normalizeConfidence,
   toRequestSegments,
   validateTranslationRequest,
   type ProviderSegmentAnswer,
 } from "@/lib/translation/validate-translation";
 import { translationCurrency } from "@/lib/translation/translation-staleness";
+import {
+  buildBatchContext,
+  buildSegmentContext,
+  contextSegmentIds,
+  resolveTranslationContextConfig,
+  validateContext,
+  type TranslationContextConfig,
+} from "@/lib/translation/translation-context-builder";
+import { assessTranslationDuration } from "@/lib/translation/duration-warning";
+import { segmentDurationSeconds } from "@/lib/translation/duration-estimator";
 import { ProcessingError } from "@/server/processing/processing-errors";
 import type {
   StageRunContext,
@@ -108,6 +126,7 @@ export interface TranslationServiceOptions {
   translations?: TranslationRepository;
   dialogues?: DialogueService;
   config?: Partial<TranslationConfig>;
+  contextConfig?: Partial<TranslationContextConfig>;
   createId?: () => string;
   now?: () => Date;
   logger?: (message: string, detail?: Record<string, unknown>) => void;
@@ -155,6 +174,7 @@ export class TranslationService implements StageRunner {
   private readonly translations: TranslationRepository;
   private readonly dialogues: DialogueService;
   private readonly config: TranslationConfig;
+  private readonly contextConfig: TranslationContextConfig;
   private readonly createId: () => string;
   private readonly now: () => Date;
   private readonly logger: (
@@ -167,6 +187,7 @@ export class TranslationService implements StageRunner {
     this.translations = options.translations ?? translationRepository;
     this.dialogues = options.dialogues ?? dialogueService;
     this.config = resolveTranslationConfig(options.config);
+    this.contextConfig = resolveTranslationContextConfig(options.contextConfig);
     this.createId = options.createId ?? randomUUID;
     this.now = options.now ?? (() => new Date());
     this.logger = options.logger ?? defaultLogger;
@@ -273,9 +294,27 @@ export class TranslationService implements StageRunner {
     };
   }
 
+  /**
+   * All three translation operations run through one job type.
+   *
+   * They share a lifecycle, a provider, a cancellation story and an error
+   * model, and differ only in scope: `full` replaces the whole translation,
+   * while the segment operations replace exactly one line and leave every other
+   * one byte-identical.
+   */
   async run(context: StageRunContext): Promise<TranslateJobResult> {
     try {
-      return await this.translate(context);
+      const parameters = context.job.parameters;
+
+      if (!parameters || parameters.kind !== "translate") {
+        throw translationError("TRANSLATION_SOURCE_REQUIRED", {
+          details: "translate job created without translation parameters",
+        });
+      }
+
+      return parameters.operation === "full"
+        ? await this.translate(context, parameters)
+        : await this.translateSegment(context, parameters);
     } catch (cause) {
       throw toProcessingError(cause);
     }
@@ -283,16 +322,9 @@ export class TranslationService implements StageRunner {
 
   private async translate(
     context: StageRunContext,
+    parameters: TranslateJobParameters,
   ): Promise<TranslateJobResult> {
     const { job, signal, onProgress } = context;
-    const parameters = job.parameters;
-
-    if (!parameters || parameters.kind !== "translate") {
-      throw translationError("TRANSLATION_SOURCE_REQUIRED", {
-        details: "translate job created without translation parameters",
-      });
-    }
-
     const { sourceLanguage, targetLanguage } = parameters;
 
     // Refused before a provider is touched: translating a language into itself
@@ -327,6 +359,8 @@ export class TranslationService implements StageRunner {
       sourceLanguage,
       targetLanguage,
       segments: allSegments,
+      operation: "full",
+      options: DEFAULT_DUBBING_OPTIONS,
     };
 
     const validation = validateTranslationRequest(request);
@@ -347,7 +381,13 @@ export class TranslationService implements StageRunner {
     onProgress(PROGRESS_PREPARED, "Translating");
 
     const started = Date.now();
-    const run = await this.runBatches(provider, request, translatable, context);
+    const run = await this.runBatches(
+      provider,
+      request,
+      translatable,
+      context,
+      dialogue,
+    );
     const { answers, usageParts, batchCount } = run;
 
     // A result that arrives after cancellation is discarded: nothing is saved
@@ -397,9 +437,16 @@ export class TranslationService implements StageRunner {
         sourceLanguage,
         targetLanguage,
         createId: this.createId,
+        providerId: provider.id,
+        providerModel,
+        generatedAt: timestamp,
+        generationMode: "initial",
+        contextSegmentIdsFor: (segmentId) =>
+          run.contextBySegmentId.get(segmentId) ?? [],
       }),
       createdAt: timestamp,
       updatedAt: timestamp,
+      revision: 0,
       ...(run.providerMetadata
         ? { providerMetadata: run.providerMetadata }
         : {}),
@@ -455,6 +502,457 @@ export class TranslationService implements StageRunner {
   }
 
   /**
+   * Regenerates or shortens exactly one line.
+   *
+   * The whole point is that it is surgical: every other line comes through
+   * byte-identical, and the line being worked on keeps its current translation
+   * until a new one has been validated and stored. If anything fails — the
+   * provider, the contract check, the dialogue moving underneath, a concurrent
+   * edit — the existing text is what remains.
+   *
+   * The two operations differ only in what the provider is asked for, so they
+   * share this path rather than duplicating the guards that make it safe.
+   */
+  private async translateSegment(
+    context: StageRunContext,
+    parameters: TranslateJobParameters,
+  ): Promise<TranslateJobResult> {
+    const { job, signal, onProgress } = context;
+    const { sourceLanguage, targetLanguage, segmentId } = parameters;
+    const shortening = parameters.operation === "shorten_segment";
+    const failureCode = shortening
+      ? ("TRANSLATION_SHORTEN_FAILED" as const)
+      : ("TRANSLATION_REGENERATION_FAILED" as const);
+
+    if (!segmentId) {
+      throw translationError(failureCode, {
+        details: "no segment was named",
+      });
+    }
+
+    if (sourceLanguage === targetLanguage) {
+      throw translationError("TRANSLATION_SAME_LANGUAGE");
+    }
+
+    onProgress(5, shortening ? "Shortening line" : "Regenerating translation");
+
+    const dialogue = await this.resolveDialogue(job.projectId, job.sourceMediaId);
+    // A single line may only be worked on against the dialogue it was requested
+    // for. Regenerating against a dialogue that has since changed would produce
+    // a line translated from text nobody is looking at.
+    this.assertMatchesJob(dialogue, parameters);
+
+    const dialogueSegment = dialogue.segments.find(
+      (segment) => segment.id === segmentId,
+    );
+
+    if (!dialogueSegment) {
+      throw translationError("TRANSLATION_SEGMENT_NOT_FOUND", {
+        details: `segment ${segmentId} is not in this dialogue`,
+      });
+    }
+
+    const identity = this.identityFor(dialogue, {
+      sourceLanguage,
+      targetLanguage,
+    });
+    const translation = await this.translations
+      .getByIdentity(identity)
+      .catch(() => null);
+
+    if (!translation) {
+      throw translationError("TRANSLATION_NOT_FOUND", {
+        details: "there is no current translation for this dialogue",
+      });
+    }
+
+    this.assertExpectedRevision(translation, parameters);
+
+    const existing = translation.segments.find(
+      (segment) => segment.dialogueSegmentId === segmentId,
+    );
+
+    if (!existing) {
+      throw translationError("TRANSLATION_SEGMENT_NOT_FOUND", {
+        details: `segment ${segmentId} is not in this translation`,
+      });
+    }
+
+    // Nothing to say, nothing to shorten, nothing to regenerate.
+    if (!isTranslatableText(dialogueSegment.originalText)) {
+      throw translationError(failureCode, {
+        details: "this line has no source text",
+      });
+    }
+
+    const provider = this.registry.get(job.providerId);
+
+    if (!(await provider.isAvailable())) {
+      throw translationError("TRANSLATION_PROVIDER_UNAVAILABLE", {
+        details: `provider ${provider.id} is not configured on this server`,
+      });
+    }
+
+    // Neighbouring lines, including what they currently read as in the target
+    // language — that is what keeps a regenerated line consistent with the
+    // conversation it sits in.
+    const segmentContext = provider.capabilities.supportsContext
+      ? buildSegmentContext(dialogue, segmentId, {
+          config: this.contextConfig,
+          translation,
+        })
+      : null;
+
+    if (provider.capabilities.supportsContext && !segmentContext) {
+      throw translationError("TRANSLATION_CONTEXT_BUILD_FAILED", {
+        details: `context could not be built for segment ${segmentId}`,
+      });
+    }
+
+    const contextCheck = validateContext(dialogue, segmentContext);
+
+    if (!contextCheck.ok) {
+      throw translationError("TRANSLATION_CONTEXT_BUILD_FAILED", {
+        details: contextCheck.details,
+      });
+    }
+
+    const sourceDuration = segmentDurationSeconds(dialogueSegment);
+    const requestSegment: TranslationRequestSegment = {
+      segmentId,
+      speakerId: dialogueSegment.speakerId,
+      speakerName: speakerDisplayName(
+        dialogue.speakers,
+        dialogueSegment.speakerId,
+      ),
+      startTime: dialogueSegment.startTime,
+      endTime: dialogueSegment.endTime,
+      durationSeconds: sourceDuration,
+      sourceText: dialogueSegment.originalText,
+      currentTranslation: existing.translatedText,
+      ...(segmentContext ? { context: segmentContext } : {}),
+    };
+
+    const request: TranslationRequest = {
+      projectId: job.projectId,
+      sourceMediaId: job.sourceMediaId,
+      dialogueId: dialogue.id,
+      dialogueRevision: dialogue.editMetadata.revision,
+      sourceLanguage,
+      targetLanguage,
+      segments: [requestSegment],
+      operation: shortening ? "shorter" : "regenerate",
+      options: DEFAULT_DUBBING_OPTIONS,
+    };
+
+    onProgress(40, shortening ? "Shortening line" : "Regenerating translation");
+
+    const started = Date.now();
+    const result = await this.callProvider(provider, request, context, {
+      done: 0,
+      total: 1,
+    });
+
+    // A result that arrives after cancellation is discarded: the line keeps the
+    // translation it already had.
+    this.throwIfAborted(signal);
+
+    // The provider was given context lines; answering for one of them would
+    // silently overwrite a neighbour. Matching against the single requested
+    // segment rejects that outright.
+    const matched = matchProviderResults([requestSegment], result.segments);
+
+    if (!matched.ok) {
+      throw translationError(matched.code, { details: matched.details });
+    }
+
+    const answer = matched.bySegmentId.get(segmentId);
+
+    if (!answer) {
+      throw translationError(failureCode, {
+        details: "the provider returned nothing for this line",
+      });
+    }
+
+    onProgress(PROGRESS_SAVING, "Saving translation");
+
+    // Everything is re-checked immediately before the write: the dialogue may
+    // have been corrected, and the translation may have been edited elsewhere,
+    // while the provider was working.
+    const currentDialogue = await this.resolveDialogue(
+      job.projectId,
+      job.sourceMediaId,
+    );
+    this.assertMatchesJob(currentDialogue, parameters);
+
+    const currentTranslation = await this.translations
+      .getByIdentity(identity)
+      .catch(() => null);
+
+    if (!currentTranslation || currentTranslation.id !== translation.id) {
+      throw translationError("TRANSLATION_REVISION_CONFLICT", {
+        details: "the translation was replaced while this line was running",
+      });
+    }
+
+    this.assertExpectedRevision(currentTranslation, parameters);
+
+    const mode: TranslationGenerationMode = shortening
+      ? "shorter"
+      : "regenerate";
+    const timestamp = this.now().toISOString();
+    const updated = this.replaceSegment(currentTranslation, segmentId, (segment) =>
+      this.withNewTranslation(segment, answer.translatedText, {
+        targetLanguage,
+        sourceDurationSeconds: sourceDuration,
+        providerId: provider.id,
+        providerModel: result.provider.model,
+        generationMode: mode,
+        generatedAt: timestamp,
+        contextSegmentIds: contextSegmentIds(segmentContext),
+        confidence: normalizeConfidence(answer.confidence),
+        providerMetadata: answer.metadata,
+      }),
+    );
+
+    const saved: DialogueTranslation = {
+      ...updated,
+      updatedAt: timestamp,
+      revision: currentTranslation.revision + 1,
+      usage: mergeUsage([currentTranslation.usage, result.usage]),
+    };
+
+    try {
+      await this.translations.save(saved);
+    } catch (cause) {
+      // Nothing was written, so the line keeps the text it had.
+      throw translationError("TRANSLATION_SAVE_FAILED", { cause });
+    }
+
+    const after = saved.segments.find(
+      (segment) => segment.dialogueSegmentId === segmentId,
+    );
+
+    this.logger(`translation segment ${mode}`, {
+      jobId: job.id,
+      projectId: job.projectId,
+      dialogueId: dialogue.id,
+      dialogueRevision: saved.dialogueRevision,
+      translationRevision: saved.revision,
+      providerId: provider.id,
+      model: result.provider.model,
+      contextSegments: contextSegmentIds(segmentContext).length,
+      durationWarning: after?.translationMetadata.durationWarning,
+      durationMs: Date.now() - started,
+    });
+
+    return {
+      kind: "translate",
+      translationId: saved.id,
+      dialogueId: saved.dialogueId,
+      dialogueRevision: saved.dialogueRevision,
+      segmentCount: saved.segments.length,
+      sourceLanguage,
+      targetLanguage,
+      providerId: provider.id,
+      providerModel: result.provider.model,
+    };
+  }
+
+  /**
+   * A person's rewrite of one translated line.
+   *
+   * Applied server-side against the stored record, like Part 8's dialogue
+   * edits, so validation and the revision check live in one place and a browser
+   * can never write a document it derived from a stale copy. The duration
+   * estimate is recomputed here, so a warning can never describe text the line
+   * no longer has.
+   *
+   * Provenance is deliberately kept: the provider and model that produced the
+   * original wording stay on the segment, and only the generation timestamp
+   * story changes — the text is now the person's.
+   */
+  async editSegmentText(
+    projectId: string,
+    sourceMediaId: string,
+    languages: { sourceLanguage: string; targetLanguage: string },
+    segmentId: string,
+    translatedText: string,
+    expectedRevision?: number | null,
+  ): Promise<
+    | { ok: true; translation: DialogueTranslation }
+    | { ok: false; code: string; message: string }
+  > {
+    try {
+      const dialogue = await this.resolveDialogue(projectId, sourceMediaId);
+      const identity = this.identityFor(dialogue, languages);
+      const translation = await this.translations.getByIdentity(identity);
+
+      if (!translation) {
+        throw translationError("TRANSLATION_NOT_FOUND");
+      }
+
+      const existing = translation.segments.find(
+        (segment) => segment.dialogueSegmentId === segmentId,
+      );
+
+      if (!existing) {
+        throw translationError("TRANSLATION_SEGMENT_NOT_FOUND");
+      }
+
+      if (
+        expectedRevision !== undefined &&
+        expectedRevision !== null &&
+        expectedRevision !== translation.revision
+      ) {
+        throw translationError("TRANSLATION_REVISION_CONFLICT", {
+          details: `expected revision ${expectedRevision}, found ${translation.revision}`,
+        });
+      }
+
+      // Nothing changed: return the document as it stands rather than inflating
+      // the revision, which segment operations use for their conflict check.
+      if (existing.translatedText === translatedText) {
+        return { ok: true, translation };
+      }
+
+      const timestamp = this.now().toISOString();
+      const sourceDuration = Math.max(0, existing.endTime - existing.startTime);
+      const updated = this.replaceSegment(translation, segmentId, (segment) => {
+        const assessment = assessTranslationDuration(
+          translatedText,
+          translation.targetLanguage,
+          sourceDuration,
+        );
+
+        return {
+          ...segment,
+          translatedText,
+          translationMetadata: {
+            ...segment.translationMetadata,
+            // Recomputed on every change to the text, never left stale.
+            estimatedDurationSeconds: assessment.estimatedSeconds,
+            sourceDurationSeconds: assessment.sourceDurationSeconds,
+            durationRatio: assessment.ratio,
+            durationWarning: assessment.warning,
+            durationEstimatorVersion: assessment.estimatorVersion,
+          },
+          editMetadata: {
+            manuallyEdited: true,
+            revision: segment.editMetadata.revision + 1,
+            editedAt: timestamp,
+          },
+        };
+      });
+
+      const saved: DialogueTranslation = {
+        ...updated,
+        updatedAt: timestamp,
+        revision: translation.revision + 1,
+      };
+
+      await this.translations.save(saved).catch((cause: unknown) => {
+        throw translationError("TRANSLATION_SAVE_FAILED", { cause });
+      });
+
+      return { ok: true, translation: saved };
+    } catch (cause) {
+      if (cause instanceof TranslationError) {
+        return { ok: false, code: cause.code, message: cause.message };
+      }
+
+      return {
+        ok: false,
+        code: "TRANSLATION_SAVE_FAILED",
+        message: "The change could not be saved.",
+      };
+    }
+  }
+
+  /** Replaces exactly one line, leaving every other one untouched. */
+  private replaceSegment(
+    translation: DialogueTranslation,
+    segmentId: string,
+    update: (segment: TranslatedDialogueSegment) => TranslatedDialogueSegment,
+  ): DialogueTranslation {
+    return {
+      ...translation,
+      segments: translation.segments.map((segment) =>
+        segment.dialogueSegmentId === segmentId ? update(segment) : segment,
+      ),
+    };
+  }
+
+  /** A newly generated translation for one line, with fresh derived metadata. */
+  private withNewTranslation(
+    segment: TranslatedDialogueSegment,
+    translatedText: string,
+    details: {
+      targetLanguage: string;
+      sourceDurationSeconds: number;
+      providerId: string;
+      providerModel: string | null;
+      generationMode: TranslationGenerationMode;
+      generatedAt: string;
+      contextSegmentIds: string[];
+      confidence: number | null;
+      providerMetadata?: Record<string, unknown>;
+    },
+  ): TranslatedDialogueSegment {
+    const assessment = assessTranslationDuration(
+      translatedText,
+      details.targetLanguage,
+      details.sourceDurationSeconds,
+    );
+
+    return {
+      ...segment,
+      translatedText,
+      confidence: details.confidence,
+      translationMetadata: {
+        providerId: details.providerId,
+        providerModel: details.providerModel,
+        generationMode: details.generationMode,
+        generatedAt: details.generatedAt,
+        contextSegmentIds: details.contextSegmentIds,
+        estimatedDurationSeconds: assessment.estimatedSeconds,
+        sourceDurationSeconds: assessment.sourceDurationSeconds,
+        durationRatio: assessment.ratio,
+        durationWarning: assessment.warning,
+        durationEstimatorVersion: assessment.estimatorVersion,
+        confidence: details.confidence,
+        ...(details.providerMetadata
+          ? { providerMetadata: details.providerMetadata }
+          : {}),
+      },
+      // Newly generated text is the machine's again: a person can edit it, but
+      // this particular wording is not theirs.
+      editMetadata: {
+        manuallyEdited: false,
+        revision: segment.editMetadata.revision + 1,
+        editedAt: segment.editMetadata.editedAt,
+      },
+    };
+  }
+
+  private assertExpectedRevision(
+    translation: DialogueTranslation,
+    parameters: TranslateJobParameters,
+  ): void {
+    const expected = parameters.expectedTranslationRevision;
+
+    if (
+      expected !== undefined &&
+      expected !== null &&
+      expected !== translation.revision
+    ) {
+      throw translationError("TRANSLATION_REVISION_CONFLICT", {
+        details: `job expected revision ${expected}, translation is at ${translation.revision}`,
+      });
+    }
+  }
+
+  /**
    * Drives the provider batch by batch.
    *
    * Batching is the service's job, not a provider's: it gives real progress
@@ -464,18 +962,25 @@ export class TranslationService implements StageRunner {
    *
    * Cancellation is checked between batches as well as inside them, so a
    * cancelled job stops before spending another provider call.
+   *
+   * Each batch carries **boundary context**: the lines just before the first
+   * and just after the last. A batch is already internally consecutive, so only
+   * its edges need filling in — which is what keeps a reply at the start of one
+   * batch consistent with the question at the end of the previous one.
    */
   private async runBatches(
     provider: TranslationProvider,
     request: TranslationRequest,
     translatable: readonly TranslationRequestSegment[],
     context: StageRunContext,
+    dialogue: UnifiedDialogue,
   ): Promise<{
     answers: ProviderSegmentAnswer[];
     usageParts: (TranslationUsage | null | undefined)[];
     batchCount: number;
     providerModel: string | null;
     providerMetadata: Record<string, unknown> | undefined;
+    contextBySegmentId: Map<string, string[]>;
   }> {
     const batchSize = provider.capabilities.supportsBatchTranslation
       ? this.config.batchSize
@@ -483,6 +988,7 @@ export class TranslationService implements StageRunner {
     const batches = batchSegments(translatable, batchSize);
     const answers: ProviderSegmentAnswer[] = [];
     const usageParts: (TranslationUsage | null | undefined)[] = [];
+    const contextBySegmentId = new Map<string, string[]>();
     // Per-run state stays local: this service is a singleton shared by every
     // concurrent job, so nothing about one translation may live on `this`.
     let providerModel: string | null = null;
@@ -492,9 +998,31 @@ export class TranslationService implements StageRunner {
     for (const batch of batches) {
       this.throwIfAborted(context.signal);
 
+      const batchIds = batch.map((segment) => segment.segmentId);
+      // A provider that ignores context still receives none rather than a
+      // half-honoured request, and the recorded context matches what was sent.
+      const batchContext = provider.capabilities.supportsContext
+        ? buildBatchContext(dialogue, batchIds, {
+            config: this.contextConfig,
+          })
+        : null;
+      const usedContextIds = contextSegmentIds(batchContext);
+
+      for (const id of batchIds) {
+        contextBySegmentId.set(id, usedContextIds);
+      }
+
       const result = await this.callProvider(
         provider,
-        { ...request, segments: batch },
+        {
+          ...request,
+          segments: batch.map((segment, index) => ({
+            ...segment,
+            // The batch shares one boundary context; attaching it to the first
+            // segment is the shape the adapter reads.
+            ...(index === 0 && batchContext ? { context: batchContext } : {}),
+          })),
+        },
         context,
         { done, total: translatable.length },
       );
@@ -523,6 +1051,7 @@ export class TranslationService implements StageRunner {
       batchCount: batches.length,
       providerModel,
       providerMetadata,
+      contextBySegmentId,
     };
   }
 

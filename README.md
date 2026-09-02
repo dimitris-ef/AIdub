@@ -2030,17 +2030,251 @@ separation and no mixing or export. The completed translation is read-only.
 Those belong to Part 10 and later, and are exactly what this provider and data
 layer exists to support.
 
+## Part 10: Context-Aware Dubbing Translation
+
+Part 9 translated each line faithfully and in isolation. Part 10 changes the
+question from *"is this line translated correctly?"* to *"does this line work as
+spoken dubbing?"* — which needs the conversation around it, the character
+speaking it, and the time it has to be said in.
+
+```
+Current editable UnifiedDialogue
+        ↓
+Context builder            (bounded, structured, from the corrected dialogue)
+        ↓
+Translation service        (full · regenerate one line · shorten one line)
+        ↓
+TranslationProvider        (the Part 9 abstraction, unchanged in shape)
+        ↓
+Context-aware translated segments + duration metadata
+        ↓
+Human review and editing   (translated text only)
+        ↓
+Persisted dubbing translation → Part 11 voice generation
+```
+
+### Context strategy
+
+Translating "Yes, he said he'll come." on its own throws away everything needed
+to translate it well: who "he" is, whether these two are on formal terms, and
+what was actually asked. So the surrounding lines travel with the request.
+
+- **Window.** Three lines before and three after by default, plus up to two
+  earlier lines by the same speaker for register consistency. Configurable in
+  one place (`DEFAULT_TRANSLATION_CONTEXT_CONFIG`), never scattered.
+- **Structured, never flattened.** Each neighbour keeps its segment id, speaker
+  and position. Merging them into a paragraph is exactly how a provider loses
+  track of which line it was asked about — and speaker names are user-supplied
+  text, so they travel as JSON values rather than being interpolated into an
+  instruction.
+- **Bounded.** A character budget trims from the outside in: speaker history
+  first, then the farthest neighbours, so the immediately adjacent lines are the
+  last to go. The line being translated is never trimmed and never appears as
+  its own context.
+- **Current.** Context is built from the editable dialogue — the corrected text
+  a person reviewed — never from the raw Part 5 transcript, and it is validated
+  against the dialogue before every provider call, so context from an older
+  revision cannot quietly inform a new translation.
+- **Batches** carry boundary context only: the lines just before the first and
+  just after the last, since a batch is already internally consecutive.
+- **Existing neighbour translations** travel too when regenerating a single
+  line, which is what keeps a name spelled the same way and a reply agreeing
+  with the line before it.
+
+The segment ids that informed each line are persisted
+(`translationMetadata.contextSegmentIds`) — ids only, because the text lives in
+the dialogue and copying it would go stale the moment the dialogue changed.
+
+### Dubbing translation philosophy
+
+The provider is asked for what a person would actually say out loud: natural
+word order, contractions, fragments left as fragments, register kept as the
+source has it. Meaning, intent and tone come first; a literal grammatical
+equivalent that no one would say is a worse dub than a natural paraphrase.
+
+What it is explicitly told **not** to do is just as important: never add emotion
+or detail the source does not have, never merge, split, reorder or drop lines,
+never translate a line it was not asked about, and never remove essential
+meaning to satisfy a duration.
+
+### Duration awareness
+
+Each line's slot is `endTime - startTime`. Against it sits an **estimate** of how
+long the translated text would take to say, produced by a pure, deterministic,
+provider-independent estimator (`estimateSpeechDuration`): spoken characters
+divided by an approximate per-language rate, plus a small beat for sentence and
+clause punctuation.
+
+| Ratio (estimated ÷ available) | Warning |
+| --- | --- |
+| ≤ 1.15 | `none` |
+| 1.15 – 1.35 | `slightly_long` |
+| > 1.35 | `likely_too_long` |
+
+Thresholds live in one place (`DURATION_RATIO_THRESHOLDS`), and the estimator
+carries a version (`durationEstimatorVersion`) so a later, better estimator can
+be told apart from this one.
+
+**This is an estimate from text, not TTS timing.** Aidub has synthesised
+nothing; actual duration depends on the voice, rate, pauses and emphasis Part 11
+chooses. Language rates are rough conversational averages, not measurements.
+That is precisely why the output is a warning a person acts on rather than a
+constraint the system enforces — and why Part 10 never loops re-compressing a
+line automatically, which would degrade meaning quietly and spend credits doing
+it. The first translation considers duration; if a line still overruns, it is
+flagged and the person decides.
+
+The estimate is recomputed on **every** change to translated text — initial
+generation, regeneration, shortening, and a manual edit — so a warning can never
+describe wording the line no longer has.
+
+### Translation metadata
+
+Every translated line carries:
+
+```ts
+interface DubbingTranslationMetadata {
+  providerId: string;
+  providerModel: string | null;
+  generationMode: "initial" | "regenerate" | "shorter";
+  generatedAt: string;
+  contextSegmentIds: string[];
+  estimatedDurationSeconds: number | null;
+  sourceDurationSeconds: number;
+  durationRatio: number | null;
+  durationWarning: "none" | "slightly_long" | "likely_too_long";
+  durationEstimatorVersion: string;
+  confidence: number | null;
+  providerMetadata?: Record<string, unknown>;
+}
+
+interface TranslationEditMetadata {
+  manuallyEdited: boolean;
+  revision: number;
+  editedAt: string | null;
+}
+```
+
+Provenance survives a manual edit: the provider and model that produced the
+wording someone then rewrote stay on the record.
+
+### Translate editor
+
+`/projects/[projectId]/translate` is now the review workspace: speaker and
+timecode, the original, and the translation, one row per dialogue line.
+
+- The **original is read-only.** Correcting what was said belongs to Transcript;
+  a second editable copy here would give one sentence two homes and no answer to
+  which wins. A link to Transcript is offered instead.
+- The **translation is editable inline** — a plain autosizing textarea, no modal.
+  It commits on blur (one save per edit, not per keystroke) and follows the
+  stored text only while unfocused, so an arriving save never yanks words out
+  from under someone typing. Save state reads `Saving… / Saved / Save failed`,
+  and a failure says so rather than claiming success.
+- Speaker names resolve from the **current dialogue** by stable `speakerId`, so
+  renaming a speaker in Transcript shows through immediately and never justifies
+  retranslating anything.
+- Clicking a row selects the same dialogue segment id Transcript and the
+  timeline use, and seeks the shared player — one identity for a line across the
+  whole workspace, never a second mapping.
+- Timing is displayed and **not editable** here.
+
+### Segment regeneration
+
+Regenerating one line is surgical: it is sent with the conversation around it
+(including neighbours' existing translations), and every other line comes back
+byte-identical. The current text stays until a new one has been validated and
+stored — if the provider fails, the contract check fails, the dialogue moves
+underneath, or a concurrent edit lands, the existing wording is what remains.
+
+A result naming a **context-only** line is rejected outright rather than
+applied, so background can never overwrite a neighbour.
+
+### Shorter alternative
+
+A line flagged `likely_too_long` gets a prominent **Make shorter**. The provider
+is asked to keep the full meaning, intent and tone and drop filler and
+roundabout phrasing — never information. Timestamps are untouched.
+
+Nothing assumes the result is actually shorter: the duration is re-estimated
+from what came back and the warning recomputed, so a "shortening" that produced
+something longer is reported as still too long. Asking again is always an
+explicit action; there is no automatic loop.
+
+### Manual edit authority
+
+Once someone edits a line, `editMetadata.manuallyEdited` is true and **their
+wording is what Part 11 will speak**. Nothing regenerates over it without them
+asking: regenerating a hand-edited line asks for confirmation, and so does a
+full retranslation when the translation contains manual edits — with the
+existing translation kept until the new run succeeds, so a failed rerun costs
+nothing.
+
+### Staleness and concurrency
+
+Part 9's rule stands: a translation is valid only for one project, source media,
+dialogue, dialogue revision and language pair. Part 10 adds the guards a
+per-line workflow needs:
+
+- A **stale** translation blocks segment operations. Regenerating one line
+  against a dialogue that has moved on would translate text nobody is looking
+  at, so the workspace asks for a full retranslation instead — the old
+  translation stays visible and is never silently rebound.
+- Every segment operation re-checks the **dialogue revision** immediately before
+  writing, and rejects the result as `TRANSLATION_SOURCE_CHANGED` if it moved.
+- Every segment operation carries the **translation revision** it was built
+  against and refuses to write if someone else's edit landed meanwhile
+  (`TRANSLATION_REVISION_CONFLICT`), so a slow request cannot clobber a newer
+  one it never saw.
+- The workspace disables conflicting controls while any operation runs, so a
+  Regenerate and a Make shorter cannot race each other onto the same line.
+
+### Processing jobs
+
+All three operations are `translate` jobs — one job type, one lifecycle, one
+cancellation and error story. `TranslateJobParameters.operation` is `full`,
+`regenerate_segment` or `shorten_segment`; the segment operations also carry the
+line and the expected translation revision. A full run reports real progress
+("Translating 14 of 52 lines"); a single line reports simply that it is
+regenerating. Cancelling never overwrites the active translated text, and a
+retry is a new job — failed jobs stay failed and historical.
+
+### Part 9 data migration
+
+Stored translations are schema **v2**. A v1 record is migrated on read, not
+discarded — the text in it cost provider credits. Defaults say what is actually
+known: `contextSegmentIds: []` (no context was used), `generationMode: "initial"`
+(Part 9 had no other way), `manuallyEdited: false` (Part 9 had no editing), and
+the provider and model it already recorded. The duration metadata is *computed*
+rather than defaulted, since it derives purely from text and language and is
+just as valid for old text as new.
+
+### Production architecture
+
+Unchanged: Vercel hosts the web app, the job coordinator dispatches work, and a
+provider or external worker does the inference. `TranslationService` takes a job
+context and repositories, so running it on an external worker stays a deployment
+change.
+
+### Explicit non-goals
+
+Part 10 implements **no** TTS, no voice generation or preview, no voice cloning,
+no measurement of synthesised speech, no timing correction (timestamps are never
+changed to fit a translation), no lip sync or phoneme alignment, no source
+separation, and no dubbed audio or video render. Duration awareness is
+preparation for Part 11, not synchronisation.
+
 ## Not implemented (on purpose)
 
 Authentication, accounts, billing, a production database, cloud media storage,
 transcoding for delivery, proxy or thumbnail generation, waveform generation,
-real queues and external workers, source separation, TTS, voice cloning,
-speaker naming or identity recognition, translation editing, dubbing-aware
-translation adaptation, timing alignment, the dubbing/mixing timeline,
-export/render processing, analytics and collaboration are all still out of
-scope. Part 9 stops at translated text: each corrected dialogue line now has a
-target-language counterpart stored beside it, and nothing is synthesised,
-aligned or mixed. There are no placeholder or mock API routes for those
+real queues and external workers, source separation, TTS, voice generation and
+cloning, speaker naming or identity recognition, timing alignment, lip sync,
+the dubbing/mixing timeline, export/render processing, analytics and
+collaboration are all still out of scope. Part 10 stops at reviewed, dubbing-
+oriented translated text: each corrected dialogue line has a target-language
+counterpart a person can edit, regenerate or shorten, with an estimate of
+whether it will fit — and nothing is synthesised, aligned or mixed. There are no placeholder or mock API routes for those
 features. Project and media persistence exist only in the temporary
 browser-local forms described above.
 
@@ -2288,3 +2522,37 @@ Part 9 adds:
 118. Part 10 builds dubbing-aware translation **on top of** this provider and
      data layer; TTS, timing, mix and export consume translations without
      modifying the source dialogue.
+
+Part 10 adds:
+
+119. Context-aware translation consumes the current editable unified dialogue;
+     context is built from it and never from raw STT.
+120. Translation context is **bounded and structured** — a configurable window,
+     trimmed from the outside in, with segment ids, speakers and order intact.
+121. Surrounding context improves wording only. A single-segment operation may
+     never mutate a neighbouring segment, and a provider result naming a
+     context-only line is rejected.
+122. Segment ids, speaker ids, timestamps and source text stay unchanged by
+     every translation operation; the 1:1 structure holds.
+123. Providers stay behind the Part 9 abstraction; capabilities let one that
+     cannot use context or dubbing constraints degrade rather than fail.
+124. Natural spoken translation is preferred over literal phrasing, and meaning
+     and intent take precedence over duration compression.
+125. Duration compatibility is an **estimate from text**, never measured audio
+     timing, and its thresholds and estimator version live in one place.
+126. Duration metadata is derived and recomputed on every change to translated
+     text, including manual edits.
+127. Manually edited translated text is authoritative downstream and is never
+     overwritten without explicit confirmation.
+128. Segment regeneration and shortening replace only the targeted line, and the
+     existing translation survives any failure.
+129. Dialogue revision determines staleness; segment operations are blocked
+     against a stale translation rather than silently rebound.
+130. Segment operations carry an expected translation revision and refuse to
+     overwrite a newer edit.
+131. Part 9 translations migrate on read rather than being invalidated.
+132. Part 11 TTS consumes the current edited translated text and may use the
+     duration metadata, but must not reinterpret translation identity.
+133. Full and segment-level operations share the one processing-job
+     architecture; translation persistence stays provider-independent and
+     replaceable.

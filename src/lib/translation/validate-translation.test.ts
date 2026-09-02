@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import type { TranslationRequest, TranslationRequestSegment } from "@/types/translation";
+import {
+  DEFAULT_DUBBING_OPTIONS,
+  type TranslationRequest,
+  type TranslationRequestSegment,
+} from "@/types/translation";
 import {
   isTranslatableText,
   matchProviderResults,
@@ -28,6 +32,7 @@ function requested(
     speakerId: "speaker_1",
     startTime: 0,
     endTime: 2,
+    durationSeconds: 2,
     sourceText,
     ...overrides,
   };
@@ -51,6 +56,8 @@ function request(
     sourceLanguage: "en",
     targetLanguage: "pl",
     segments,
+    operation: "full",
+    options: DEFAULT_DUBBING_OPTIONS,
   };
 }
 

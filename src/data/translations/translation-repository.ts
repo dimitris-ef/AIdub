@@ -1,10 +1,17 @@
 import {
   isTranslationStatus,
+  TRANSLATION_GENERATION_MODES,
   type DialogueTranslation,
+  type DubbingTranslationMetadata,
   type TranslatedDialogueSegment,
+  type TranslationEditMetadata,
+  type TranslationGenerationMode,
   type TranslationIdentity,
   type TranslationUsage,
 } from "@/types/translation";
+import { isTranslationDurationWarning } from "@/lib/translation/duration-warning";
+import { DURATION_ESTIMATOR_VERSION } from "@/lib/translation/duration-estimator";
+import { migrateTranslation } from "@/lib/translation/translation-migrations";
 
 /**
  * Translation persistence contract.
@@ -90,6 +97,84 @@ function parseUsage(value: unknown): TranslationUsage | null {
   return Object.keys(usage).length > 0 ? usage : null;
 }
 
+function parseGenerationMode(value: unknown): TranslationGenerationMode | null {
+  return typeof value === "string" &&
+    (TRANSLATION_GENERATION_MODES as readonly string[]).includes(value)
+    ? (value as TranslationGenerationMode)
+    : null;
+}
+
+function parseConfidence(value: unknown): number | null {
+  return finiteNumber(value) && value >= 0 && value <= 1 ? value : null;
+}
+
+/**
+ * Part 10 metadata, when the stored record has it.
+ *
+ * Returns null for a Part 9 record so the migration can fill it in from what is
+ * actually known, rather than this function inventing plausible-looking values
+ * that would then be indistinguishable from measured ones.
+ */
+function parseTranslationMetadata(
+  value: unknown,
+): DubbingTranslationMetadata | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const generationMode = parseGenerationMode(record.generationMode);
+
+  if (!isNonEmptyString(record.providerId) || !generationMode) {
+    return null;
+  }
+
+  return {
+    providerId: record.providerId,
+    providerModel: isNonEmptyString(record.providerModel)
+      ? record.providerModel
+      : null,
+    generationMode,
+    generatedAt: isNonEmptyString(record.generatedAt) ? record.generatedAt : "",
+    contextSegmentIds: Array.isArray(record.contextSegmentIds)
+      ? record.contextSegmentIds.filter(isNonEmptyString)
+      : [],
+    estimatedDurationSeconds: finiteNumber(record.estimatedDurationSeconds)
+      ? record.estimatedDurationSeconds
+      : null,
+    sourceDurationSeconds: finiteNumber(record.sourceDurationSeconds)
+      ? record.sourceDurationSeconds
+      : 0,
+    durationRatio: finiteNumber(record.durationRatio)
+      ? record.durationRatio
+      : null,
+    durationWarning: isTranslationDurationWarning(record.durationWarning)
+      ? record.durationWarning
+      : "none",
+    durationEstimatorVersion: isNonEmptyString(record.durationEstimatorVersion)
+      ? record.durationEstimatorVersion
+      : DURATION_ESTIMATOR_VERSION,
+    confidence: parseConfidence(record.confidence),
+    ...optionalMetadata(record.providerMetadata),
+  };
+}
+
+function parseEditMetadata(value: unknown): TranslationEditMetadata | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+
+  return {
+    manuallyEdited: record.manuallyEdited === true,
+    revision: Number.isInteger(record.revision)
+      ? (record.revision as number)
+      : 0,
+    editedAt: isNonEmptyString(record.editedAt) ? record.editedAt : null,
+  };
+}
+
 function parseSegment(value: unknown): TranslatedDialogueSegment | null {
   if (typeof value !== "object" || value === null) {
     return null;
@@ -123,12 +208,15 @@ function parseSegment(value: unknown): TranslatedDialogueSegment | null {
     translatedText: record.translatedText,
     sourceLanguage: record.sourceLanguage,
     targetLanguage: record.targetLanguage,
-    confidence:
-      finiteNumber(record.confidence) &&
-      record.confidence >= 0 &&
-      record.confidence <= 1
-        ? record.confidence
-        : null,
+    confidence: parseConfidence(record.confidence),
+    // Absent on a Part 9 record; the migration fills both in from what the
+    // translation itself already records.
+    translationMetadata: parseTranslationMetadata(
+      record.translationMetadata,
+    ) as DubbingTranslationMetadata,
+    editMetadata: parseEditMetadata(
+      record.editMetadata,
+    ) as TranslationEditMetadata,
     ...optionalMetadata(record.providerMetadata),
   };
 }
@@ -181,7 +269,9 @@ export function parseStoredTranslation(
     segments.push(segment);
   }
 
-  return {
+  // Migrated on read, so a Part 9 record loads with Part 10 metadata filled in
+  // from what it already knows rather than being discarded.
+  return migrateTranslation({
     id: record.id,
     projectId: record.projectId,
     sourceMediaId: record.sourceMediaId,
@@ -198,9 +288,10 @@ export function parseStoredTranslation(
     segments,
     createdAt: isNonEmptyString(record.createdAt) ? record.createdAt : "",
     updatedAt: isNonEmptyString(record.updatedAt) ? record.updatedAt : "",
+    revision: Number.isInteger(record.revision) ? (record.revision as number) : 0,
     ...optionalMetadata(record.providerMetadata),
     usage: parseUsage(record.usage),
-  };
+  });
 }
 
 /** True when a stored record is the translation for this exact identity. */

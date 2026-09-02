@@ -81,7 +81,14 @@ credentials and batching stay in `src/server/translation/`, and the translated
 text is persisted separately from the dialogue it came from — both languages
 stay available at once.
 
+Dubbing translation is real as of Part 10: the same client edits translated text
+through `PATCH /api/translations`, and the same processing client runs
+`regenerate_segment` and `shorten_segment` jobs alongside a full run. Context
+building, duration estimation and the provider prompts stay behind the service
+and library layers; the Translate workspace sees only normalised translation
+records.
+
 Still absent: source separation, speech synthesis, voice cloning, timing
 alignment and rendering — with no mock stand-ins. Those stages consume the
-edited unified dialogue, its translation and processing artifacts through this
-same architecture.
+edited unified dialogue, its reviewed translation and processing artifacts
+through this same architecture.

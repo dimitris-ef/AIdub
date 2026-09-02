@@ -1,10 +1,18 @@
 import type { UnifiedDialogue } from "@/types/dialogue";
-import type { TranslatedDialogueSegment } from "@/types/translation";
+import type {
+  TranslatedDialogueSegment,
+  TranslationGenerationMode,
+} from "@/types/translation";
 import {
   isTranslatableText,
   normalizeConfidence,
   type ProviderSegmentAnswer,
 } from "@/lib/translation/validate-translation";
+import { segmentDurationSeconds } from "@/lib/translation/duration-estimator";
+import {
+  defaultEditMetadata,
+  durationMetadataFor,
+} from "@/lib/translation/translation-migrations";
 
 /**
  * Turns validated provider answers into stored translation segments.
@@ -27,10 +35,21 @@ export function buildTranslatedSegments(
     sourceLanguage,
     targetLanguage,
     createId,
+    providerId,
+    providerModel,
+    generatedAt,
+    contextSegmentIdsFor,
+    generationMode = "initial",
   }: {
     sourceLanguage: string;
     targetLanguage: string;
     createId: () => string;
+    providerId: string;
+    providerModel: string | null;
+    generatedAt: string;
+    /** The context that informed each line, for auditing and regeneration. */
+    contextSegmentIdsFor?: (dialogueSegmentId: string) => string[];
+    generationMode?: TranslationGenerationMode;
   },
 ): TranslatedDialogueSegment[] {
   // Iterating the dialogue — not the answers — is what makes the output order
@@ -38,6 +57,8 @@ export function buildTranslatedSegments(
   return dialogue.segments.map((segment) => {
     const answer = answers.get(segment.id);
     const translatable = isTranslatableText(segment.originalText);
+    const translatedText = translatable ? (answer?.translatedText ?? "") : "";
+    const confidence = normalizeConfidence(answer?.confidence);
 
     return {
       id: createId(),
@@ -48,10 +69,28 @@ export function buildTranslatedSegments(
       startTime: segment.startTime,
       endTime: segment.endTime,
       sourceText: segment.originalText,
-      translatedText: translatable ? (answer?.translatedText ?? "") : "",
+      translatedText,
       sourceLanguage,
       targetLanguage,
-      confidence: normalizeConfidence(answer?.confidence),
+      confidence,
+      translationMetadata: {
+        providerId,
+        providerModel,
+        generationMode,
+        generatedAt,
+        contextSegmentIds: contextSegmentIdsFor?.(segment.id) ?? [],
+        // Derived from the text just produced, so a warning can never describe
+        // wording the line no longer has.
+        ...durationMetadataFor(
+          translatedText,
+          targetLanguage,
+          segmentDurationSeconds(segment),
+        ),
+        confidence,
+        ...(answer?.metadata ? { providerMetadata: answer.metadata } : {}),
+      },
+      // A freshly generated line carries no human corrections yet.
+      editMetadata: defaultEditMetadata(),
       ...(answer?.metadata ? { providerMetadata: answer.metadata } : {}),
     };
   });

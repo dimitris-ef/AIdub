@@ -1,8 +1,12 @@
 import type {
   DialogueTranslation,
+  DubbingTranslationMetadata,
   TranslatedDialogueSegment,
+  TranslationEditMetadata,
 } from "@/types/translation";
 import { isTranslationStatus } from "@/types/translation";
+import { isTranslationDurationWarning } from "@/lib/translation/duration-warning";
+import { DURATION_ESTIMATOR_VERSION } from "@/lib/translation/duration-estimator";
 
 /**
  * The frontend's view of dialogue translation.
@@ -51,6 +55,17 @@ export class TranslationRequestError extends Error {
   }
 }
 
+export interface EditTranslatedSegmentRequest {
+  segmentId: string;
+  translatedText: string;
+  /**
+   * The translation revision the edit was composed against. The server refuses
+   * the write if the translation has moved on, so a slow save can never
+   * overwrite a newer change it never saw.
+   */
+  expectedRevision?: number | null;
+}
+
 export interface TranslationClient {
   getTranslation(
     projectId: string,
@@ -58,6 +73,19 @@ export interface TranslationClient {
     languages: { sourceLanguage: string; targetLanguage: string },
     signal?: AbortSignal,
   ): Promise<TranslationResponse>;
+  /**
+   * Rewrites one line's translated text.
+   *
+   * Only the target text: the original stays in the dialogue and is corrected
+   * in the Transcript workspace, never here.
+   */
+  editSegment(
+    projectId: string,
+    sourceMediaId: string,
+    languages: { sourceLanguage: string; targetLanguage: string },
+    edit: EditTranslatedSegmentRequest,
+    signal?: AbortSignal,
+  ): Promise<DialogueTranslation>;
 }
 
 function invalid(): never {
@@ -72,6 +100,68 @@ function isTranslationState(value: unknown): value is TranslationState {
     typeof value === "string" &&
     (TRANSLATION_STATES as readonly string[]).includes(value)
   );
+}
+
+/**
+ * Dubbing metadata as it comes off the wire.
+ *
+ * The server migrates Part 9 records before serving them, so this should
+ * always be present; the defaults exist so a UI still renders rather than
+ * throwing if it ever isn't, and they say "unknown" rather than "fine".
+ */
+function parseTranslationMetadata(value: unknown): DubbingTranslationMetadata {
+  const record = (typeof value === "object" && value !== null
+    ? value
+    : {}) as Partial<DubbingTranslationMetadata>;
+
+  return {
+    providerId: typeof record.providerId === "string" ? record.providerId : "",
+    providerModel:
+      typeof record.providerModel === "string" ? record.providerModel : null,
+    generationMode:
+      record.generationMode === "regenerate" || record.generationMode === "shorter"
+        ? record.generationMode
+        : "initial",
+    generatedAt: typeof record.generatedAt === "string" ? record.generatedAt : "",
+    contextSegmentIds: Array.isArray(record.contextSegmentIds)
+      ? record.contextSegmentIds.filter(
+          (id): id is string => typeof id === "string",
+        )
+      : [],
+    estimatedDurationSeconds:
+      typeof record.estimatedDurationSeconds === "number"
+        ? record.estimatedDurationSeconds
+        : null,
+    sourceDurationSeconds:
+      typeof record.sourceDurationSeconds === "number"
+        ? record.sourceDurationSeconds
+        : 0,
+    durationRatio:
+      typeof record.durationRatio === "number" ? record.durationRatio : null,
+    durationWarning: isTranslationDurationWarning(record.durationWarning)
+      ? record.durationWarning
+      : "none",
+    durationEstimatorVersion:
+      typeof record.durationEstimatorVersion === "string"
+        ? record.durationEstimatorVersion
+        : DURATION_ESTIMATOR_VERSION,
+    confidence: typeof record.confidence === "number" ? record.confidence : null,
+    ...(record.providerMetadata
+      ? { providerMetadata: record.providerMetadata }
+      : {}),
+  };
+}
+
+function parseEditMetadata(value: unknown): TranslationEditMetadata {
+  const record = (typeof value === "object" && value !== null
+    ? value
+    : {}) as Partial<TranslationEditMetadata>;
+
+  return {
+    manuallyEdited: record.manuallyEdited === true,
+    revision: Number.isInteger(record.revision) ? (record.revision as number) : 0,
+    editedAt: typeof record.editedAt === "string" ? record.editedAt : null,
+  };
 }
 
 function parseSegment(value: unknown): TranslatedDialogueSegment {
@@ -104,6 +194,8 @@ function parseSegment(value: unknown): TranslatedDialogueSegment {
     targetLanguage: segment.targetLanguage ?? "",
     confidence:
       typeof segment.confidence === "number" ? segment.confidence : null,
+    translationMetadata: parseTranslationMetadata(segment.translationMetadata),
+    editMetadata: parseEditMetadata(segment.editMetadata),
     ...(segment.providerMetadata
       ? { providerMetadata: segment.providerMetadata }
       : {}),
@@ -146,6 +238,11 @@ export function parseTranslation(value: unknown): DialogueTranslation {
     segments: translation.segments.map(parseSegment),
     createdAt: translation.createdAt ?? "",
     updatedAt: translation.updatedAt ?? "",
+    revision:
+      typeof translation.revision === "number" &&
+      Number.isInteger(translation.revision)
+        ? translation.revision
+        : 0,
     ...(translation.providerMetadata
       ? { providerMetadata: translation.providerMetadata }
       : {}),
@@ -200,6 +297,45 @@ export class HttpTranslationClient implements TranslationClient {
         ? { staleReason: body.staleReason }
         : {}),
     };
+  }
+
+  async editSegment(
+    projectId: string,
+    sourceMediaId: string,
+    languages: { sourceLanguage: string; targetLanguage: string },
+    edit: EditTranslatedSegmentRequest,
+    signal?: AbortSignal,
+  ): Promise<DialogueTranslation> {
+    const query = new URLSearchParams({
+      projectId,
+      mediaId: sourceMediaId,
+      sourceLanguage: languages.sourceLanguage,
+      targetLanguage: languages.targetLanguage,
+    });
+
+    const response = await fetch(`${this.baseUrl}?${query.toString()}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(edit),
+      signal,
+      cache: "no-store",
+    });
+
+    const body = (await response.json().catch(() => null)) as {
+      translation?: unknown;
+      error?: { code?: string; message?: string };
+    } | null;
+
+    if (!response.ok || !body?.translation) {
+      // The server says why in plain language; nothing here invents a success
+      // the store did not actually record.
+      throw new TranslationRequestError(
+        body?.error?.code ?? "REQUEST_FAILED",
+        body?.error?.message ?? "The change could not be saved.",
+      );
+    }
+
+    return parseTranslation(body.translation);
   }
 }
 

@@ -20,13 +20,32 @@ import type {
  * A provider translates text. It never decides who is speaking, never moves a
  * timestamp, and never changes how many lines there are — those relationships
  * belong to the dialogue and are preserved around the provider, not by it.
+ *
+ * From Part 10 a request also carries the conversation around each line, the
+ * duration it has to fit, and what the translation should optimise for. All of
+ * that is **guidance**: a provider answers for the lines in `segments` and for
+ * nothing else, and a result naming a context-only line is rejected rather than
+ * applied. Capabilities let a provider that cannot use any of it degrade to
+ * plain segment-preserving translation instead of failing.
  */
 
 export interface TranslationProviderCapabilities {
   /** Whether several lines can be translated in one call. */
   supportsBatchTranslation: boolean;
-  /** Whether surrounding lines can be supplied as context. Part 10 uses this. */
+  /**
+   * Whether surrounding lines are actually used as context. A provider that
+   * reports false still receives a request carrying context — it simply
+   * ignores it, and the service records that no context informed the result.
+   */
   supportsContext: boolean;
+  /**
+   * Whether the provider can act on dubbing intent: keep tone, write natural
+   * spoken phrasing, prefer wording that fits the available duration, and
+   * produce a shorter alternative on request.
+   */
+  supportsDubbingConstraints: boolean;
+  /** Whether the provider answers in a schema-constrained structured form. */
+  supportsStructuredOutput: boolean;
   /** Whether a terminology glossary can be supplied. */
   supportsGlossary: boolean;
   /** Whether the provider reports a meaningful per-line confidence. */

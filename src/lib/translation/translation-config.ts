@@ -36,13 +36,16 @@ export const DEFAULT_TRANSLATION_CONFIG: TranslationConfig = {
  * Persisted shape version for stored translations.
  *
  * v1 — Part 9: one translated line per dialogue line, no edits, no alternates.
+ * v2 — Part 10: dubbing metadata (context ids, duration estimate, ratio,
+ *      warning, generation mode) and per-segment edit metadata, plus a
+ *      translation-level revision.
  *
- * Later parts will add context-aware translation, alternate takes, approved
- * text, a timing-fitted variant and translation edit history. Those arrive as
- * v2 written alongside this and migrated on read — never by discarding Part 9
- * data, which is expensive to reproduce because it costs provider credits.
+ * A v1 record is **migrated on read**, not discarded: its translated text is
+ * real work that cost provider credits, and the new fields all have honest
+ * defaults — no context was recorded, so none is claimed, and the duration
+ * estimate is derived from the text it already has.
  */
-export const TRANSLATION_SCHEMA_VERSION = 1;
+export const TRANSLATION_SCHEMA_VERSION = 2;
 
 function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);

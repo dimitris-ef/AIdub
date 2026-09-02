@@ -70,6 +70,7 @@ function translation(
     segments: [],
     createdAt: "2026-08-28T11:05:00.000Z",
     updatedAt: "2026-08-28T11:05:00.000Z",
+    revision: 0,
     usage: null,
     ...overrides,
   };

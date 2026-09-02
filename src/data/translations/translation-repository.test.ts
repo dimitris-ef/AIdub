@@ -48,10 +48,25 @@ function translation(
         sourceLanguage: "en",
         targetLanguage: "pl",
         confidence: null,
+        translationMetadata: {
+          providerId: "mock",
+          providerModel: "deterministic-v1",
+          generationMode: "initial",
+          generatedAt: "2026-08-28T12:00:00.000Z",
+          contextSegmentIds: [],
+          estimatedDurationSeconds: 0.7,
+          sourceDurationSeconds: 2,
+          durationRatio: 0.35,
+          durationWarning: "none",
+          durationEstimatorVersion: "v1",
+          confidence: null,
+        },
+        editMetadata: { manuallyEdited: false, revision: 0, editedAt: null },
       },
     ],
     createdAt: "2026-08-28T12:00:00.000Z",
     updatedAt: "2026-08-28T12:00:00.000Z",
+    revision: 0,
     usage: { inputCharacters: 6, requestCount: 1 },
     ...overrides,
   };
@@ -223,6 +238,37 @@ describe("parseStoredTranslation", () => {
     (record.segments as Record<string, unknown>[])[0].confidence = 4;
 
     expect(parseStoredTranslation(record)?.segments[0].confidence).toBeNull();
+  });
+
+  it("migrates a Part 9 record on read rather than discarding it", () => {
+    const partNine = JSON.parse(
+      JSON.stringify(translation()),
+    ) as Record<string, unknown>;
+    partNine.version = 1;
+    delete partNine.revision;
+    const segments = partNine.segments as Record<string, unknown>[];
+    delete segments[0].translationMetadata;
+    delete segments[0].editMetadata;
+
+    const parsed = parseStoredTranslation(partNine);
+
+    expect(parsed?.version).toBe(TRANSLATION_SCHEMA_VERSION);
+    expect(parsed?.segments[0].translatedText).toBe("[pl] Hello.");
+    expect(parsed?.segments[0].translationMetadata.generationMode).toBe(
+      "initial",
+    );
+    expect(parsed?.segments[0].translationMetadata.contextSegmentIds).toEqual([]);
+    expect(parsed?.segments[0].editMetadata.manuallyEdited).toBe(false);
+    expect(parsed?.revision).toBe(0);
+  });
+
+  it("keeps Part 10 metadata that is already stored", () => {
+    const parsed = parseStoredTranslation(
+      JSON.parse(JSON.stringify(translation({ revision: 3 }))),
+    );
+
+    expect(parsed?.revision).toBe(3);
+    expect(parsed?.segments[0].translationMetadata.durationRatio).toBe(0.35);
   });
 
   it("rejects a record with no dialogue revision", () => {

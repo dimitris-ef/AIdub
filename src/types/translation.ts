@@ -27,6 +27,10 @@
  * Part 10's job and needs this layer underneath it first.
  */
 
+import type { TranslationDurationWarning } from "@/lib/translation/duration-warning";
+
+export type { TranslationDurationWarning };
+
 export const TRANSLATION_STATUSES = [
   "processing",
   "completed",
@@ -55,6 +59,63 @@ export interface TranslationUsage {
 }
 
 /**
+ * Why a line's current translation exists.
+ *
+ * Recorded so provenance survives: a line the user shortened, a line they
+ * regenerated and a line from the original full run are all "translated", but
+ * they got there differently, and that matters when reviewing the result.
+ */
+export const TRANSLATION_GENERATION_MODES = [
+  "initial",
+  "regenerate",
+  "shorter",
+] as const;
+
+export type TranslationGenerationMode =
+  (typeof TRANSLATION_GENERATION_MODES)[number];
+
+/**
+ * What produced a line's translation, and how well it is likely to fit.
+ *
+ * The duration fields are **derived**: they can be recomputed from the text at
+ * any time and are refreshed on every change to it. They are an estimate from
+ * text, never a measurement of synthesised speech — see
+ * `@/lib/translation/duration-estimator`.
+ */
+export interface DubbingTranslationMetadata {
+  providerId: string;
+  providerModel: string | null;
+  generationMode: TranslationGenerationMode;
+  generatedAt: string;
+  /**
+   * The dialogue segments whose text was given to the provider as surrounding
+   * context. Ids only: the text itself lives in the dialogue, and duplicating
+   * it here would go stale the moment the dialogue was edited.
+   */
+  contextSegmentIds: string[];
+  /** Estimated seconds of speech for `translatedText`. Null if unknowable. */
+  estimatedDurationSeconds: number | null;
+  /** The slot the dialogue gives this line. */
+  sourceDurationSeconds: number;
+  /** `estimated / source`, or null when there is nothing to compare. */
+  durationRatio: number | null;
+  durationWarning: TranslationDurationWarning;
+  /** Which estimator produced the numbers above. */
+  durationEstimatorVersion: string;
+  /** Normalised 0–1, or null when the provider reports nothing comparable. */
+  confidence: number | null;
+  providerMetadata?: Record<string, unknown>;
+}
+
+/** Whether a person has rewritten this line's translation, and how often. */
+export interface TranslationEditMetadata {
+  manuallyEdited: boolean;
+  /** Bumped once per persisted change to this line, not per keystroke. */
+  revision: number;
+  editedAt: string | null;
+}
+
+/**
  * One translated line.
  *
  * `id` is this record's own identity; `dialogueSegmentId` is the relationship
@@ -66,6 +127,10 @@ export interface TranslationUsage {
  * later part can build: with the source text, speaker and timing recorded per
  * segment, it is possible to work out *which* lines changed rather than only
  * that the dialogue did.
+ *
+ * `translatedText` is the text Part 11 will speak. Once a person edits it,
+ * `editMetadata.manuallyEdited` is true and their wording is authoritative —
+ * nothing regenerates over it without them asking.
  */
 export interface TranslatedDialogueSegment {
   id: string;
@@ -84,6 +149,8 @@ export interface TranslatedDialogueSegment {
   targetLanguage: string;
   /** Normalised 0–1, or null when the provider reports nothing comparable. */
   confidence: number | null;
+  translationMetadata: DubbingTranslationMetadata;
+  editMetadata: TranslationEditMetadata;
   providerMetadata?: Record<string, unknown>;
 }
 
@@ -113,6 +180,12 @@ export interface DialogueTranslation {
   segments: TranslatedDialogueSegment[];
   createdAt: string;
   updatedAt: string;
+  /**
+   * Bumped by every persisted change to this translation — a manual edit, a
+   * regenerated line, a shortened line. Segment-level operations carry the
+   * revision they expect, so a slow request can never overwrite a newer edit.
+   */
+  revision: number;
   /** Provider-specific detail. Never read by the domain or the UI. */
   providerMetadata?: Record<string, unknown>;
   usage?: TranslationUsage | null;
@@ -134,19 +207,94 @@ export interface TranslationIdentity {
   targetLanguage: string;
 }
 
+/**
+ * One surrounding line, supplied so a provider can interpret the line it is
+ * actually translating. Never something to translate in its own right.
+ *
+ * `existingTranslation` is what that neighbour currently reads as in the target
+ * language, when there is one. It is what keeps a regenerated line consistent
+ * with the conversation around it — the same name spelled the same way, the
+ * same level of formality, a pronoun that agrees with the line before it.
+ */
+export interface TranslationContextSegment {
+  segmentId: string;
+  speakerId: string | null;
+  /** Human-readable label for prompting only; `speakerId` stays canonical. */
+  speakerName?: string | null;
+  startTime: number;
+  endTime: number;
+  sourceText: string;
+  existingTranslation?: string | null;
+}
+
+/**
+ * The conversation around one line.
+ *
+ * Structured rather than a blob of prose: a provider has to be able to tell
+ * which line is which, who said it, and in what order. Flattening it into a
+ * paragraph is exactly how pronouns get misattributed.
+ */
+export interface TranslationSegmentContext {
+  previousSegments: TranslationContextSegment[];
+  nextSegments: TranslationContextSegment[];
+  /**
+   * Recent lines by this same speaker, when they fall outside the immediate
+   * window. Helps keep one character's register consistent across a scene.
+   */
+  currentSpeakerRecentSegments?: TranslationContextSegment[];
+  /**
+   * Reserved. Aidub performs no scene analysis, so this stays null rather than
+   * being filled with a summary nothing actually produced.
+   */
+  sceneSummary?: string | null;
+}
+
 /** One line handed to a provider. Structure it must preserve, not interpret. */
 export interface TranslationRequestSegment {
   segmentId: string;
   /**
-   * Passed for traceability and for future speaker-aware translation. Part 9
-   * providers must not vary style by speaker, and must never assign one.
+   * Passed for traceability and for speaker continuity. A provider may keep one
+   * character's register consistent, but must never assign or change a speaker.
    */
   speakerId: string | null;
+  /** Display name for prompting only; the id is what anything joins on. */
+  speakerName?: string | null;
   /** Passed to preserve structure and enable later alignment. Never edited. */
   startTime: number;
   endTime: number;
+  /** `endTime - startTime`: the slot this line has to be spoken in. */
+  durationSeconds: number;
   sourceText: string;
+  /** The line's current translation, for regeneration and shortening. */
+  currentTranslation?: string | null;
+  /** The conversation around this line. Guidance, never output. */
+  context?: TranslationSegmentContext;
 }
+
+/**
+ * What the translation should optimise for.
+ *
+ * Flags rather than free text so a provider that cannot honour one can ignore
+ * it without having to parse an instruction — see
+ * `TranslationProviderCapabilities.supportsDubbingConstraints`.
+ */
+export interface DubbingTranslationOptions {
+  /** Keep register, humour, urgency and politeness as the source has them. */
+  preserveTone: boolean;
+  /** Write what a person would actually say, not a grammatical equivalent. */
+  preferNaturalSpeech: boolean;
+  /** Prefer phrasing that fits the line's slot, without losing meaning. */
+  considerDuration: boolean;
+}
+
+/**
+ * What a request is asking the provider to do.
+ *
+ * `full` translates a batch; `regenerate` produces a fresh translation for one
+ * line already translated once; `shorter` asks for a more concise phrasing of
+ * a line that is likely to overrun.
+ */
+export type TranslationOperation = "full" | "regenerate" | "shorter";
 
 /**
  * A normalised translation request. Providers see only this — never a project
@@ -159,8 +307,18 @@ export interface TranslationRequest {
   dialogueRevision: number;
   sourceLanguage: string;
   targetLanguage: string;
+  /** The lines to translate. Everything else in the request is context. */
   segments: TranslationRequestSegment[];
+  operation: TranslationOperation;
+  options: DubbingTranslationOptions;
 }
+
+/** The defaults every Aidub translation runs with. */
+export const DEFAULT_DUBBING_OPTIONS: DubbingTranslationOptions = {
+  preserveTone: true,
+  preferNaturalSpeech: true,
+  considerDuration: true,
+};
 
 export function isTranslationStatus(value: unknown): value is TranslationStatus {
   return (

@@ -12,10 +12,13 @@ import { parseJobParameters } from "@/lib/processing/job-parameters";
 
 const valid = {
   kind: "translate",
+  operation: "full",
   dialogueId: "dialogue-1",
   dialogueRevision: 3,
   sourceLanguage: "en",
   targetLanguage: "pl",
+  segmentId: null,
+  expectedTranslationRevision: null,
 };
 
 const encode = (value: unknown) => JSON.stringify(value);
@@ -64,6 +67,46 @@ describe("parseJobParameters", () => {
     expect(
       parseJobParameters(encode({ ...valid, dialogueRevision: 0 })),
     ).toEqual({ ...valid, dialogueRevision: 0 });
+  });
+
+  it("defaults to a full run when no operation is named", () => {
+    // A Part 9 client had no operations to name; its request is a full run.
+    expect(
+      parseJobParameters(encode({ ...valid, operation: undefined })),
+    ).toEqual(valid);
+  });
+
+  it("accepts a segment operation that names its line", () => {
+    expect(
+      parseJobParameters(
+        encode({
+          ...valid,
+          operation: "regenerate_segment",
+          segmentId: "d-1",
+          expectedTranslationRevision: 4,
+        }),
+      ),
+    ).toEqual({
+      ...valid,
+      operation: "regenerate_segment",
+      segmentId: "d-1",
+      expectedTranslationRevision: 4,
+    });
+  });
+
+  it("rejects a segment operation with no line to act on", () => {
+    // The backend must never pick a line for itself.
+    expect(
+      parseJobParameters(
+        encode({ ...valid, operation: "shorten_segment", segmentId: null }),
+      ),
+    ).toBeNull();
+  });
+
+  it("rejects an operation it does not know", () => {
+    expect(
+      parseJobParameters(encode({ ...valid, operation: "rewrite_everything" })),
+    ).toBeNull();
   });
 
   it("rejects languages Aidub does not know", () => {

@@ -1,5 +1,9 @@
 import { getLanguageLabel } from "@/lib/languages";
-import type { TranslationRequest, TranslationUsage } from "@/types/translation";
+import type {
+  TranslationContextSegment,
+  TranslationRequest,
+  TranslationUsage,
+} from "@/types/translation";
 import {
   TranslationError,
   errorCodeForHttpStatus,
@@ -36,11 +40,17 @@ import type {
  *   AIDUB_TRANSLATION_BASE_URL  default https://api.openai.com/v1
  *   AIDUB_TRANSLATION_MODEL     default gpt-4o-mini
  *
- * Part 9 scope: faithful, segment-preserving translation. The prompt asks for
- * accuracy and natural target-language phrasing and nothing else — no
- * shortening to fit a take, no lip-sync phrasing, no scene context, no
- * character voice. Those belong to Part 10 and would change the meaning of the
- * text this layer is supposed to preserve.
+ * From Part 10 the prompt is **dubbing-aware**: each line arrives with the
+ * conversation around it, the speaker who says it and the duration it has to
+ * fit, and the model is asked for natural spoken dialogue rather than a
+ * grammatical equivalent. Three operations share one prompt shape — an initial
+ * translation, a regeneration of one line, and a shorter phrasing of a line
+ * that overruns — because they differ only in what is being asked for, not in
+ * how the answer is structured.
+ *
+ * What it still does not do: change how many lines there are, move a timestamp,
+ * decide a speaker, or compress meaning away to hit a duration. Duration is a
+ * preference the model is told about, never a limit it must satisfy.
  */
 
 export const OPENAI_COMPATIBLE_TRANSLATION_PROVIDER_ID = "openai-compatible";
@@ -67,6 +77,18 @@ interface ChatCompletionResponse {
   id?: unknown;
 }
 
+/** One background line, as structured data rather than interpolated prose. */
+function toContextEntry(segment: TranslationContextSegment) {
+  return {
+    segmentId: segment.segmentId,
+    speaker: segment.speakerName ?? segment.speakerId ?? "Unknown",
+    text: segment.sourceText,
+    ...(segment.existingTranslation
+      ? { existingTranslation: segment.existingTranslation }
+      : {}),
+  };
+}
+
 function optionalNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value)
     ? value
@@ -74,24 +96,39 @@ function optionalNumber(value: unknown): number | undefined {
 }
 
 const SYSTEM_PROMPT = [
-  "You are a professional subtitle translator.",
-  "You translate one line of dialogue at a time and you never merge, split, reorder or drop lines.",
-  "Translate the meaning faithfully and write natural, idiomatic target-language text.",
-  "Preserve names, numbers and proper nouns. Keep the register and tone of the original.",
+  "You are a professional dubbing translator working on spoken dialogue.",
+  "Write what a person would actually say out loud in the target language, not a word-for-word rendering.",
+  "Use contractions, natural word order, and idiomatic phrasing. Keep fragments as fragments and interruptions as interruptions.",
+  "Use the surrounding lines only to interpret the line you are translating: resolve pronouns, references, questions and replies, and keep names, recurring terms and formality consistent with them.",
+  "Keep each speaker's register consistent — formal stays formal, casual stays casual.",
+  "Preserve meaning, intent and tone exactly as the source has them. Never add emotion, emphasis or detail that is not there.",
+  "Preserve names, numbers and proper nouns.",
+  "You never merge, split, reorder or drop lines, and you never translate a line you were not asked to translate.",
   "Do not add explanations, notes, transliterations or commentary.",
-  "Do not shorten or expand a line to fit any duration.",
   'Reply with JSON only, as {"segments":[{"segmentId":"...","translatedText":"..."}]}.',
-  "Return exactly one entry for every segmentId you were given, using that same id.",
+  "Return exactly one entry for every segmentId in the list you were asked to translate, using that same id, and no other ids.",
 ].join(" ");
+
+/** What each operation asks for, on top of the shared rules above. */
+const OPERATION_INSTRUCTIONS: Record<TranslationRequest["operation"], string> = {
+  full: "Translate each line listed under \"translate\".",
+  regenerate:
+    'Translate the line listed under "translate" again. A previous translation is shown as "currentTranslation"; produce a better one that reads more naturally as spoken dialogue and fits the conversation around it. Do not simply repeat it.',
+  shorter:
+    'Rewrite the line listed under "translate" so it takes less time to say. A previous translation is shown as "currentTranslation". Keep the full meaning, intent and tone — drop filler and roundabout phrasing, never information. If it cannot be shortened without losing meaning, return the shortest faithful version you can.',
+};
+
+const DURATION_INSTRUCTION =
+  'Each line has "availableSeconds", the time it has in the finished dub. Prefer phrasing that can reasonably be spoken in that time. This is a preference, not a limit: never remove essential meaning to satisfy it.';
 
 export class OpenAiCompatibleTranslationProvider implements TranslationProvider {
   readonly id = OPENAI_COMPATIBLE_TRANSLATION_PROVIDER_ID;
   readonly displayName = "OpenAI-compatible translation API";
   readonly capabilities: TranslationProviderCapabilities = {
     supportsBatchTranslation: true,
-    // Part 10 territory: the adapter could send neighbouring lines, but Part 9
-    // deliberately does not, so the capability reports what is actually wired.
-    supportsContext: false,
+    supportsContext: true,
+    supportsDubbingConstraints: true,
+    supportsStructuredOutput: true,
     supportsGlossary: false,
     // Chat completions expose no per-line translation confidence, and an
     // invented one would be worse than none.
@@ -236,21 +273,57 @@ export class OpenAiCompatibleTranslationProvider implements TranslationProvider 
   }
 
   /**
-   * The request the model sees: stable ids beside source text, and the language
-   * pair named explicitly. The target language is never left for the model to
-   * infer — that is Aidub's decision, taken from the project.
+   * The request the model sees.
+   *
+   * Everything is structured JSON, including the speaker labels: a speaker name
+   * is user-supplied text, and interpolating it into prose is how prompt
+   * instructions end up inside a name. As a JSON string value it is data.
+   *
+   * The lines to translate and the lines that are only context sit in separate
+   * keys so there is no ambiguity about which is which — the single most
+   * important property of this prompt, since answering for a context line would
+   * silently overwrite a neighbour's translation.
    */
   private userPrompt(request: TranslationRequest): string {
-    const segments = request.segments.map((segment) => ({
+    const target = request.segments.map((segment) => ({
       segmentId: segment.segmentId,
+      speaker: segment.speakerName ?? segment.speakerId ?? "Unknown",
       text: segment.sourceText,
+      ...(request.options.considerDuration
+        ? { availableSeconds: Math.round(segment.durationSeconds * 100) / 100 }
+        : {}),
+      ...(segment.currentTranslation
+        ? { currentTranslation: segment.currentTranslation }
+        : {}),
     }));
 
+    // A batch shares one context; a single-line request carries its own.
+    const context = request.segments[0]?.context;
+    const before = context ? context.previousSegments.map(toContextEntry) : [];
+    const after = context ? context.nextSegments.map(toContextEntry) : [];
+    const speakerHistory = context?.currentSpeakerRecentSegments?.map(
+      toContextEntry,
+    );
+
+    const payload = {
+      sourceLanguage: `${getLanguageLabel(request.sourceLanguage)} (${request.sourceLanguage})`,
+      targetLanguage: `${getLanguageLabel(request.targetLanguage)} (${request.targetLanguage})`,
+      ...(before.length > 0 ? { contextBefore: before } : {}),
+      translate: target,
+      ...(after.length > 0 ? { contextAfter: after } : {}),
+      ...(speakerHistory && speakerHistory.length > 0
+        ? { sameSpeakerEarlier: speakerHistory }
+        : {}),
+    };
+
     return [
-      `Translate each line from ${getLanguageLabel(request.sourceLanguage)} (${request.sourceLanguage})`,
-      ` to ${getLanguageLabel(request.targetLanguage)} (${request.targetLanguage}).`,
-      `\nReturn one entry per segmentId, unchanged.\n\n`,
-      JSON.stringify({ segments }, null, 2),
+      OPERATION_INSTRUCTIONS[request.operation],
+      request.options.considerDuration ? ` ${DURATION_INSTRUCTION}` : "",
+      before.length > 0 || after.length > 0
+        ? " Lines under contextBefore, contextAfter and sameSpeakerEarlier are background only — never return them."
+        : "",
+      "\nReturn one entry for every segmentId under \"translate\", and nothing else.\n\n",
+      JSON.stringify(payload, null, 2),
     ].join("");
   }
 

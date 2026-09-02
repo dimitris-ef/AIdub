@@ -124,7 +124,9 @@ function stubProvider(
     displayName: "Stub translator",
     capabilities: overrides.capabilities ?? {
       supportsBatchTranslation: true,
-      supportsContext: false,
+      supportsContext: true,
+      supportsDubbingConstraints: true,
+      supportsStructuredOutput: true,
       supportsGlossary: false,
       supportsConfidence: false,
       reportsUsage: false,
@@ -237,8 +239,11 @@ describe("TranslationService", () => {
       audioArtifactId: null,
       parameters: {
         kind: "translate",
+        operation: "full",
         dialogueId: dialogue.id,
         dialogueRevision: dialogue.editMetadata.revision,
+        segmentId: null,
+        expectedTranslationRevision: null,
         ...languages,
       },
       ...overrides,
@@ -733,7 +738,9 @@ describe("TranslationService", () => {
           // One line per call, so there is a second batch to skip.
           capabilities: {
             supportsBatchTranslation: false,
-            supportsContext: false,
+            supportsContext: true,
+            supportsDubbingConstraints: true,
+            supportsStructuredOutput: true,
             supportsGlossary: false,
             supportsConfidence: false,
             reportsUsage: false,
@@ -761,7 +768,9 @@ describe("TranslationService", () => {
         {
           capabilities: {
             supportsBatchTranslation: false,
-            supportsContext: false,
+            supportsContext: true,
+            supportsDubbingConstraints: true,
+            supportsStructuredOutput: true,
             supportsGlossary: false,
             supportsConfidence: false,
             reportsUsage: false,
@@ -784,7 +793,9 @@ describe("TranslationService", () => {
         {
           capabilities: {
             supportsBatchTranslation: false,
-            supportsContext: false,
+            supportsContext: true,
+            supportsDubbingConstraints: true,
+            supportsStructuredOutput: true,
             supportsGlossary: false,
             supportsConfidence: false,
             reportsUsage: true,
@@ -919,6 +930,825 @@ describe("TranslationService", () => {
 
       expect(resolution.state).toBe("dialogue_required");
       expect(resolution.translation).toBeNull();
+    });
+  });
+
+  describe("context-aware translation (Part 10)", () => {
+    it("gives a batch the lines around it as context", async () => {
+      const seen: TranslationRequest[] = [];
+      const provider = stubProvider(
+        async (request) => {
+          seen.push(structuredClone(request));
+          return echo(request);
+        },
+        {
+          // One line per call, so each has genuine boundary context.
+          capabilities: {
+            supportsBatchTranslation: false,
+            supportsContext: true,
+            supportsDubbingConstraints: true,
+            supportsStructuredOutput: true,
+            supportsGlossary: false,
+            supportsConfidence: false,
+            reportsUsage: false,
+          },
+        },
+      );
+
+      const { dialogue } = await run(provider);
+
+      // The second line is asked about with the first as background.
+      const second = seen[1];
+
+      expect(second.segments[0].context?.previousSegments[0].segmentId).toBe(
+        dialogue.segments[0].id,
+      );
+      expect(second.operation).toBe("full");
+      expect(second.options.preferNaturalSpeech).toBe(true);
+    });
+
+    it("tells the provider how long each line has", async () => {
+      let received: TranslationRequest | null = null;
+      const provider = stubProvider(async (request) => {
+        received = structuredClone(request);
+        return echo(request);
+      });
+
+      const { dialogue } = await run(provider);
+      const sent = received as unknown as TranslationRequest;
+
+      expect(sent.segments[0].durationSeconds).toBeCloseTo(
+        dialogue.segments[0].endTime - dialogue.segments[0].startTime,
+        5,
+      );
+      expect(sent.segments[0].speakerName).toBe("Speaker 1");
+    });
+
+    it("records the context that informed each line", async () => {
+      const { result } = await run(
+        stubProvider(async (request) => echo(request), {
+          capabilities: {
+            supportsBatchTranslation: false,
+            supportsContext: true,
+            supportsDubbingConstraints: true,
+            supportsStructuredOutput: true,
+            supportsGlossary: false,
+            supportsConfidence: false,
+            reportsUsage: false,
+          },
+        }),
+      );
+      const stored = await translations.getById(result.translationId);
+      const dialogue = await currentDialogue();
+
+      expect(
+        stored?.segments[1].translationMetadata.contextSegmentIds,
+      ).toContain(dialogue.segments[0].id);
+    });
+
+    it("sends no context to a provider that cannot use it", async () => {
+      let received: TranslationRequest | null = null;
+      const provider = stubProvider(
+        async (request) => {
+          received = structuredClone(request);
+          return echo(request);
+        },
+        {
+          capabilities: {
+            supportsBatchTranslation: true,
+            supportsContext: false,
+            supportsDubbingConstraints: false,
+            supportsStructuredOutput: false,
+            supportsGlossary: false,
+            supportsConfidence: false,
+            reportsUsage: false,
+          },
+        },
+      );
+
+      const { result } = await run(provider);
+      const sent = received as unknown as TranslationRequest;
+      const stored = await translations.getById(result.translationId);
+
+      expect(sent.segments[0].context).toBeUndefined();
+      // And the record says so, rather than claiming context it never had.
+      expect(stored?.segments[0].translationMetadata.contextSegmentIds).toEqual(
+        [],
+      );
+    });
+
+    it("records duration metadata for every line", async () => {
+      const { result } = await run();
+      const stored = await translations.getById(result.translationId);
+
+      for (const segment of stored?.segments ?? []) {
+        const metadata = segment.translationMetadata;
+
+        expect(metadata.durationEstimatorVersion).toBe("v1");
+        expect(metadata.sourceDurationSeconds).toBeCloseTo(
+          segment.endTime - segment.startTime,
+          5,
+        );
+        expect(metadata.estimatedDurationSeconds).not.toBeNull();
+        expect(["none", "slightly_long", "likely_too_long"]).toContain(
+          metadata.durationWarning,
+        );
+      }
+    });
+
+    it("marks a full run as the initial generation", async () => {
+      const { result } = await run();
+      const stored = await translations.getById(result.translationId);
+
+      expect(
+        stored?.segments.every(
+          (s) => s.translationMetadata.generationMode === "initial",
+        ),
+      ).toBe(true);
+      expect(stored?.segments.every((s) => !s.editMetadata.manuallyEdited)).toBe(
+        true,
+      );
+      expect(stored?.revision).toBe(0);
+    });
+  });
+
+  describe("segment regeneration", () => {
+    async function translateThen(
+      operation: "regenerate_segment" | "shorten_segment",
+      provider?: TranslationProvider,
+      overrides: { segmentId?: string; expectedRevision?: number | null } = {},
+    ) {
+      const first = await run();
+      const dialogue = await currentDialogue();
+      const before = (await translations.getById(first.result.translationId))!;
+      const segmentId = overrides.segmentId ?? dialogue.segments[0].id;
+
+      const ctx = context(dialogue, {
+        job: {
+          parameters: {
+            kind: "translate",
+            operation,
+            dialogueId: dialogue.id,
+            dialogueRevision: dialogue.editMetadata.revision,
+            segmentId,
+            expectedTranslationRevision:
+              overrides.expectedRevision === undefined
+                ? before.revision
+                : overrides.expectedRevision,
+            ...LANGUAGES,
+          },
+        },
+      }).context;
+
+      return { before, dialogue, segmentId, ctx, service: createService(provider) };
+    }
+
+    it("changes only the line it was asked about", async () => {
+      const { before, segmentId, ctx, service } =
+        await translateThen("regenerate_segment");
+
+      await service.run(ctx);
+
+      const after = (await translations.getByIdentity({
+        projectId: PROJECT,
+        sourceMediaId: MEDIA,
+        dialogueId: before.dialogueId,
+        dialogueRevision: before.dialogueRevision,
+        ...LANGUAGES,
+      }))!;
+
+      const changed = after.segments.find(
+        (s) => s.dialogueSegmentId === segmentId,
+      )!;
+      const untouched = after.segments.filter(
+        (s) => s.dialogueSegmentId !== segmentId,
+      );
+      const untouchedBefore = before.segments.filter(
+        (s) => s.dialogueSegmentId !== segmentId,
+      );
+
+      expect(changed.translatedText).not.toBe(
+        before.segments.find((s) => s.dialogueSegmentId === segmentId)!
+          .translatedText,
+      );
+      // Every neighbour is byte-identical.
+      expect(JSON.stringify(untouched)).toBe(JSON.stringify(untouchedBefore));
+    });
+
+    it("keeps the segment id, speaker and timestamps", async () => {
+      const { before, segmentId, ctx, service } =
+        await translateThen("regenerate_segment");
+
+      await service.run(ctx);
+
+      const after = (await translations.getById(before.id))!;
+      const original = before.segments.find(
+        (s) => s.dialogueSegmentId === segmentId,
+      )!;
+      const updated = after.segments.find(
+        (s) => s.dialogueSegmentId === segmentId,
+      )!;
+
+      expect(updated.dialogueSegmentId).toBe(original.dialogueSegmentId);
+      expect(updated.speakerId).toBe(original.speakerId);
+      expect(updated.startTime).toBe(original.startTime);
+      expect(updated.endTime).toBe(original.endTime);
+      expect(updated.sourceText).toBe(original.sourceText);
+    });
+
+    it("gives the provider the conversation around the line", async () => {
+      let received: TranslationRequest | null = null;
+      const { dialogue, ctx, service } = await translateThen(
+        "regenerate_segment",
+        stubProvider(async (request) => {
+          received = structuredClone(request);
+          return echo(request);
+        }),
+        { segmentId: undefined },
+      );
+
+      await service.run(ctx);
+
+      const sent = received as unknown as TranslationRequest;
+
+      expect(sent.operation).toBe("regenerate");
+      expect(sent.segments).toHaveLength(1);
+      expect(sent.segments[0].currentTranslation).toBeTruthy();
+      expect(sent.segments[0].context?.nextSegments[0].segmentId).toBe(
+        dialogue.segments[1].id,
+      );
+      // The neighbour's existing translation travels too, for continuity.
+      expect(
+        sent.segments[0].context?.nextSegments[0].existingTranslation,
+      ).toBeTruthy();
+    });
+
+    it("records the regeneration in the segment's metadata", async () => {
+      const { before, segmentId, ctx, service } =
+        await translateThen("regenerate_segment");
+
+      await service.run(ctx);
+
+      const updated = (await translations.getById(before.id))!.segments.find(
+        (s) => s.dialogueSegmentId === segmentId,
+      )!;
+
+      expect(updated.translationMetadata.generationMode).toBe("regenerate");
+      expect(updated.translationMetadata.providerId).toBe("mock");
+      expect(updated.translationMetadata.contextSegmentIds.length).toBeGreaterThan(
+        0,
+      );
+    });
+
+    it("bumps the translation revision once", async () => {
+      const { before, ctx, service } = await translateThen("regenerate_segment");
+
+      await service.run(ctx);
+
+      expect((await translations.getById(before.id))!.revision).toBe(
+        before.revision + 1,
+      );
+    });
+
+    it("leaves the previous text in place when the provider fails", async () => {
+      const { before, ctx, service } = await translateThen(
+        "regenerate_segment",
+        stubProvider(async () => {
+          throw translationError("TRANSLATION_REQUEST_FAILED");
+        }),
+      );
+
+      await expect(service.run(ctx)).rejects.toMatchObject({
+        code: "TRANSLATION_REQUEST_FAILED",
+      });
+
+      const after = (await translations.getById(before.id))!;
+
+      expect(JSON.stringify(after.segments)).toBe(
+        JSON.stringify(before.segments),
+      );
+      expect(after.revision).toBe(before.revision);
+    });
+
+    it("refuses a result that names a neighbouring line instead", async () => {
+      const { before, dialogue, ctx, service } = await translateThen(
+        "regenerate_segment",
+        stubProvider(async (request) => ({
+          ...echo(request),
+          // A context line, answered for as though it had been requested.
+          segments: [
+            {
+              segmentId: dialogue?.segments[1].id ?? "other",
+              translatedText: "Should never be applied.",
+              confidence: null,
+            },
+          ],
+        })),
+      );
+
+      await expect(service.run(ctx)).rejects.toMatchObject({
+        code: "TRANSLATION_UNKNOWN_SEGMENT",
+      });
+
+      // The neighbour it tried to rewrite is untouched.
+      expect(JSON.stringify((await translations.getById(before.id))!.segments)).toBe(
+        JSON.stringify(before.segments),
+      );
+    });
+
+    it("refuses to run against a dialogue that has moved on", async () => {
+      const { before, dialogue, ctx, service } =
+        await translateThen("regenerate_segment");
+
+      await editor.applyEdit(PROJECT, MEDIA, {
+        type: "update_text",
+        segmentId: dialogue.segments[1].id,
+        text: "Changed after the job was created.",
+      });
+
+      await expect(service.run(ctx)).rejects.toMatchObject({
+        code: "TRANSLATION_SOURCE_CHANGED",
+      });
+      expect(JSON.stringify((await translations.getById(before.id))!.segments)).toBe(
+        JSON.stringify(before.segments),
+      );
+    });
+
+    it("refuses to overwrite a newer edit it never saw", async () => {
+      const { before, segmentId, ctx, service } = await translateThen(
+        "regenerate_segment",
+        undefined,
+        // The job was built against revision 0.
+        { expectedRevision: 0 },
+      );
+
+      // Someone edits another line in the meantime.
+      await createService().editSegmentText(
+        PROJECT,
+        MEDIA,
+        LANGUAGES,
+        before.segments[1].dialogueSegmentId,
+        "Edited by someone else.",
+      );
+
+      await expect(service.run(ctx)).rejects.toMatchObject({
+        code: "TRANSLATION_REVISION_CONFLICT",
+      });
+
+      const after = (await translations.getById(before.id))!;
+
+      expect(
+        after.segments.find((s) => s.dialogueSegmentId === segmentId)!
+          .translatedText,
+      ).toBe(
+        before.segments.find((s) => s.dialogueSegmentId === segmentId)!
+          .translatedText,
+      );
+    });
+
+    it("refuses a line that is not in the dialogue", async () => {
+      const { ctx, service } = await translateThen(
+        "regenerate_segment",
+        undefined,
+        { segmentId: "not-a-segment" },
+      );
+
+      await expect(service.run(ctx)).rejects.toMatchObject({
+        code: "TRANSLATION_SEGMENT_NOT_FOUND",
+      });
+    });
+  });
+
+  describe("shorter alternative", () => {
+    async function shorten(provider?: TranslationProvider) {
+      const first = await run();
+      const dialogue = await currentDialogue();
+      const before = (await translations.getById(first.result.translationId))!;
+      const segmentId = dialogue.segments[0].id;
+
+      const ctx = context(dialogue, {
+        job: {
+          parameters: {
+            kind: "translate",
+            operation: "shorten_segment",
+            dialogueId: dialogue.id,
+            dialogueRevision: dialogue.editMetadata.revision,
+            segmentId,
+            expectedTranslationRevision: before.revision,
+            ...LANGUAGES,
+          },
+        },
+      }).context;
+
+      return { before, segmentId, ctx, service: createService(provider) };
+    }
+
+    it("produces shorter text and re-estimates the duration", async () => {
+      const { before, segmentId, ctx, service } = await shorten();
+
+      await service.run(ctx);
+
+      const original = before.segments.find(
+        (s) => s.dialogueSegmentId === segmentId,
+      )!;
+      const updated = (await translations.getById(before.id))!.segments.find(
+        (s) => s.dialogueSegmentId === segmentId,
+      )!;
+
+      expect(updated.translatedText.length).toBeLessThan(
+        original.translatedText.length,
+      );
+      // Recomputed, not carried over.
+      expect(updated.translationMetadata.estimatedDurationSeconds).toBeLessThan(
+        original.translationMetadata.estimatedDurationSeconds!,
+      );
+      expect(updated.translationMetadata.generationMode).toBe("shorter");
+    });
+
+    it("keeps the segment identity, speaker and timestamps", async () => {
+      const { before, segmentId, ctx, service } = await shorten();
+
+      await service.run(ctx);
+
+      const original = before.segments.find(
+        (s) => s.dialogueSegmentId === segmentId,
+      )!;
+      const updated = (await translations.getById(before.id))!.segments.find(
+        (s) => s.dialogueSegmentId === segmentId,
+      )!;
+
+      expect(updated.dialogueSegmentId).toBe(original.dialogueSegmentId);
+      expect(updated.speakerId).toBe(original.speakerId);
+      expect([updated.startTime, updated.endTime]).toEqual([
+        original.startTime,
+        original.endTime,
+      ]);
+    });
+
+    it("asks the provider to shorten, with the current text to work from", async () => {
+      let received: TranslationRequest | null = null;
+      const { ctx, service } = await shorten(
+        stubProvider(async (request) => {
+          received = structuredClone(request);
+
+          return {
+            ...echo(request),
+            segments: [
+              {
+                segmentId: request.segments[0].segmentId,
+                translatedText: "Krótko.",
+                confidence: null,
+              },
+            ],
+          };
+        }),
+      );
+
+      await service.run(ctx);
+
+      const sent = received as unknown as TranslationRequest;
+
+      expect(sent.operation).toBe("shorter");
+      // The provider needs the current wording to have something to condense.
+      expect(sent.segments[0].currentTranslation).toBeTruthy();
+      expect(sent.options.considerDuration).toBe(true);
+      expect(sent.segments[0].durationSeconds).toBeGreaterThan(0);
+    });
+
+    it("leaves the previous text in place when shortening fails", async () => {
+      const { before, ctx, service } = await shorten(
+        stubProvider(async () => {
+          throw translationError("TRANSLATION_REQUEST_FAILED");
+        }),
+      );
+
+      await expect(service.run(ctx)).rejects.toMatchObject({
+        code: "TRANSLATION_REQUEST_FAILED",
+      });
+      expect(JSON.stringify((await translations.getById(before.id))!.segments)).toBe(
+        JSON.stringify(before.segments),
+      );
+    });
+
+    it("does not assume the provider actually shortened anything", async () => {
+      // A provider that returns something longer still gets its result stored,
+      // but the recomputed warning describes what it actually produced.
+      const longer = "A very much longer replacement than the original was.";
+      const { before, segmentId, ctx, service } = await shorten(
+        stubProvider(async (request) => ({
+          ...echo(request),
+          segments: [
+            {
+              segmentId: request.segments[0].segmentId,
+              translatedText: longer,
+              confidence: null,
+            },
+          ],
+        })),
+      );
+
+      await service.run(ctx);
+
+      const updated = (await translations.getById(before.id))!.segments.find(
+        (s) => s.dialogueSegmentId === segmentId,
+      )!;
+
+      expect(updated.translatedText).toBe(longer);
+      expect(updated.translationMetadata.durationWarning).toBe(
+        "likely_too_long",
+      );
+    });
+  });
+
+  describe("manual translation editing", () => {
+    async function translated() {
+      const first = await run();
+
+      return (await translations.getById(first.result.translationId))!;
+    }
+
+    it("persists a manual edit and marks the line as edited", async () => {
+      const before = await translated();
+      const segmentId = before.segments[0].dialogueSegmentId;
+
+      const outcome = await createService().editSegmentText(
+        PROJECT,
+        MEDIA,
+        LANGUAGES,
+        segmentId,
+        "Moja własna wersja.",
+      );
+
+      expect(outcome.ok).toBe(true);
+
+      const stored = (await translations.getById(before.id))!;
+      const edited = stored.segments.find(
+        (s) => s.dialogueSegmentId === segmentId,
+      )!;
+
+      expect(edited.translatedText).toBe("Moja własna wersja.");
+      expect(edited.editMetadata.manuallyEdited).toBe(true);
+      expect(edited.editMetadata.revision).toBe(1);
+      expect(edited.editMetadata.editedAt).not.toBeNull();
+      expect(stored.revision).toBe(before.revision + 1);
+    });
+
+    it("recomputes the duration estimate and warning", async () => {
+      const before = await translated();
+      const segmentId = before.segments[0].dialogueSegmentId;
+      const original = before.segments[0].translationMetadata;
+
+      await createService().editSegmentText(
+        PROJECT,
+        MEDIA,
+        LANGUAGES,
+        segmentId,
+        "This is a far longer replacement line than the original ever was, and it keeps going well beyond the time available.",
+      );
+
+      const edited = (await translations.getById(before.id))!.segments.find(
+        (s) => s.dialogueSegmentId === segmentId,
+      )!;
+
+      expect(edited.translationMetadata.estimatedDurationSeconds).toBeGreaterThan(
+        original.estimatedDurationSeconds!,
+      );
+      expect(edited.translationMetadata.durationWarning).toBe("likely_too_long");
+    });
+
+    it("changes only the line that was edited", async () => {
+      const before = await translated();
+      const segmentId = before.segments[0].dialogueSegmentId;
+
+      await createService().editSegmentText(
+        PROJECT,
+        MEDIA,
+        LANGUAGES,
+        segmentId,
+        "Zmienione.",
+      );
+
+      const after = (await translations.getById(before.id))!;
+
+      expect(JSON.stringify(after.segments.slice(1))).toBe(
+        JSON.stringify(before.segments.slice(1)),
+      );
+    });
+
+    it("keeps the provenance of the wording it replaced", async () => {
+      const before = await translated();
+      const segmentId = before.segments[0].dialogueSegmentId;
+
+      await createService().editSegmentText(
+        PROJECT,
+        MEDIA,
+        LANGUAGES,
+        segmentId,
+        "Zmienione.",
+      );
+
+      const edited = (await translations.getById(before.id))!.segments.find(
+        (s) => s.dialogueSegmentId === segmentId,
+      )!;
+
+      expect(edited.translationMetadata.providerId).toBe("mock");
+      expect(edited.translationMetadata.providerModel).toBe("deterministic-v1");
+    });
+
+    it("never touches the dialogue, transcript or diarization", async () => {
+      const before = await translated();
+      const dialogueBefore = JSON.stringify(await currentDialogue());
+      const transcriptBefore = JSON.stringify(
+        await transcripts.getByProject(PROJECT, MEDIA),
+      );
+      const diarizationBefore = JSON.stringify(
+        await diarizations.getByProjectAndSource(PROJECT, MEDIA),
+      );
+
+      await createService().editSegmentText(
+        PROJECT,
+        MEDIA,
+        LANGUAGES,
+        before.segments[0].dialogueSegmentId,
+        "Zmienione.",
+      );
+
+      expect(JSON.stringify(await currentDialogue())).toBe(dialogueBefore);
+      expect(
+        JSON.stringify(await transcripts.getByProject(PROJECT, MEDIA)),
+      ).toBe(transcriptBefore);
+      expect(
+        JSON.stringify(await diarizations.getByProjectAndSource(PROJECT, MEDIA)),
+      ).toBe(diarizationBefore);
+    });
+
+    it("does not inflate the revision when nothing changed", async () => {
+      const before = await translated();
+      const segment = before.segments[0];
+
+      await createService().editSegmentText(
+        PROJECT,
+        MEDIA,
+        LANGUAGES,
+        segment.dialogueSegmentId,
+        segment.translatedText,
+      );
+
+      expect((await translations.getById(before.id))!.revision).toBe(
+        before.revision,
+      );
+    });
+
+    it("refuses an edit composed against an older revision", async () => {
+      const before = await translated();
+      const segmentId = before.segments[0].dialogueSegmentId;
+
+      await createService().editSegmentText(
+        PROJECT,
+        MEDIA,
+        LANGUAGES,
+        segmentId,
+        "First.",
+      );
+
+      const outcome = await createService().editSegmentText(
+        PROJECT,
+        MEDIA,
+        LANGUAGES,
+        segmentId,
+        "Second, from a stale client.",
+        before.revision,
+      );
+
+      expect(outcome).toMatchObject({
+        ok: false,
+        code: "TRANSLATION_REVISION_CONFLICT",
+      });
+      expect(
+        (await translations.getById(before.id))!.segments.find(
+          (s) => s.dialogueSegmentId === segmentId,
+        )!.translatedText,
+      ).toBe("First.");
+    });
+
+    it("refuses a line that is not in the translation", async () => {
+      await translated();
+
+      expect(
+        await createService().editSegmentText(
+          PROJECT,
+          MEDIA,
+          LANGUAGES,
+          "not-a-segment",
+          "Nope.",
+        ),
+      ).toMatchObject({ ok: false, code: "TRANSLATION_SEGMENT_NOT_FOUND" });
+    });
+
+    it("reports a failure rather than claiming a save", async () => {
+      const before = await translated();
+      vi.spyOn(translations, "save").mockRejectedValueOnce(new Error("disk full"));
+
+      const outcome = await createService().editSegmentText(
+        PROJECT,
+        MEDIA,
+        LANGUAGES,
+        before.segments[0].dialogueSegmentId,
+        "Zmienione.",
+      );
+
+      expect(outcome).toMatchObject({
+        ok: false,
+        code: "TRANSLATION_SAVE_FAILED",
+      });
+    });
+
+    it("survives being read back from a fresh repository", async () => {
+      const before = await translated();
+      const segmentId = before.segments[0].dialogueSegmentId;
+
+      await createService().editSegmentText(
+        PROJECT,
+        MEDIA,
+        LANGUAGES,
+        segmentId,
+        "Zapisane na stałe.",
+      );
+
+      const reopened = new DevelopmentTranslationRepository(
+        path.join(root, "translations"),
+      );
+      const stored = (await reopened.getById(before.id))!;
+      const edited = stored.segments.find(
+        (s) => s.dialogueSegmentId === segmentId,
+      )!;
+
+      expect(edited.translatedText).toBe("Zapisane na stałe.");
+      expect(edited.editMetadata.manuallyEdited).toBe(true);
+      expect(edited.translationMetadata.durationWarning).toBeDefined();
+      expect(stored.revision).toBe(1);
+    });
+  });
+
+  describe("full retranslation over manual edits", () => {
+    it("keeps the edited translation when the rerun fails", async () => {
+      const first = await run();
+      const before = (await translations.getById(first.result.translationId))!;
+      const segmentId = before.segments[0].dialogueSegmentId;
+
+      await createService().editSegmentText(
+        PROJECT,
+        MEDIA,
+        LANGUAGES,
+        segmentId,
+        "Ręcznie poprawione.",
+      );
+
+      await expect(
+        run(
+          stubProvider(async () => {
+            throw translationError("TRANSLATION_REQUEST_FAILED");
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "TRANSLATION_REQUEST_FAILED" });
+
+      const stored = await translations.getByIdentity({
+        projectId: PROJECT,
+        sourceMediaId: MEDIA,
+        dialogueId: before.dialogueId,
+        dialogueRevision: before.dialogueRevision,
+        ...LANGUAGES,
+      });
+
+      expect(
+        stored?.segments.find((s) => s.dialogueSegmentId === segmentId)
+          ?.translatedText,
+      ).toBe("Ręcznie poprawione.");
+    });
+
+    it("replaces manual edits once the rerun succeeds", async () => {
+      const first = await run();
+      const before = (await translations.getById(first.result.translationId))!;
+      const segmentId = before.segments[0].dialogueSegmentId;
+
+      await createService().editSegmentText(
+        PROJECT,
+        MEDIA,
+        LANGUAGES,
+        segmentId,
+        "Ręcznie poprawione.",
+      );
+
+      const second = await run();
+      const after = (await translations.getById(second.result.translationId))!;
+
+      expect(
+        after.segments.find((s) => s.dialogueSegmentId === segmentId)
+          ?.translatedText,
+      ).not.toBe("Ręcznie poprawione.");
+      expect(after.segments.every((s) => !s.editMetadata.manuallyEdited)).toBe(
+        true,
+      );
     });
   });
 

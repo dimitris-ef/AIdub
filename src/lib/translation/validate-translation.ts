@@ -1,8 +1,10 @@
 import type { UnifiedDialogue } from "@/types/dialogue";
+import { speakerDisplayName } from "@/types/dialogue";
 import type {
   TranslationRequest,
   TranslationRequestSegment,
 } from "@/types/translation";
+import { segmentDurationSeconds } from "@/lib/translation/duration-estimator";
 
 /**
  * The contract between Aidub and any translation provider, enforced in one
@@ -65,8 +67,12 @@ export function toRequestSegments(
   return dialogue.segments.map((segment) => ({
     segmentId: segment.id,
     speakerId: segment.speakerId,
+    // A label for the provider's benefit only. The id is what anything joins
+    // on, and the name is resolved fresh so a rename never needs a retranslate.
+    speakerName: speakerDisplayName(dialogue.speakers, segment.speakerId),
     startTime: segment.startTime,
     endTime: segment.endTime,
+    durationSeconds: segmentDurationSeconds(segment),
     sourceText: segment.originalText,
   }));
 }

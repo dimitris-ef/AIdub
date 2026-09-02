@@ -80,6 +80,12 @@ export const PROCESSING_ERROR_CODES = [
   "TRANSLATION_SOURCE_REQUIRED",
   "TRANSLATION_SAME_LANGUAGE",
   "TRANSLATION_UNSUPPORTED_LANGUAGE",
+  "TRANSLATION_CONTEXT_BUILD_FAILED",
+  "TRANSLATION_REGENERATION_FAILED",
+  "TRANSLATION_SHORTEN_FAILED",
+  "TRANSLATION_SEGMENT_NOT_FOUND",
+  "TRANSLATION_REVISION_CONFLICT",
+  "TRANSLATION_NOT_FOUND",
   "TRANSLATION_CANCELLED",
   "AUDIO_EXTRACTION_FAILED",
   "CONVERSION_FAILED",
@@ -193,14 +199,51 @@ export type ProcessingJobResult =
  * and later stages will need their own inputs (a voice assignment, a mix
  * preset) without every job type growing fields it ignores.
  */
+/**
+ * What a translate job is being asked to do.
+ *
+ * All three share one job type rather than becoming separate systems: they
+ * differ in scope, not in lifecycle. A full run replaces the whole translation;
+ * the two segment operations replace exactly one line and leave every other one
+ * byte-identical.
+ */
+export const TRANSLATION_JOB_OPERATIONS = [
+  "full",
+  "regenerate_segment",
+  "shorten_segment",
+] as const;
+
+export type TranslationJobOperation =
+  (typeof TRANSLATION_JOB_OPERATIONS)[number];
+
 export interface TranslateJobParameters {
   kind: "translate";
+  operation: TranslationJobOperation;
   /** The exact dialogue the job was created against. */
   dialogueId: string;
   /** The exact `editMetadata.revision` of that dialogue. */
   dialogueRevision: number;
   sourceLanguage: string;
   targetLanguage: string;
+  /** The line to act on. Required by the segment operations, null for `full`. */
+  segmentId?: string | null;
+  /**
+   * The translation revision the request was built against.
+   *
+   * A segment operation refuses to write if the translation has moved on since
+   * — someone else's newer edit must not be silently overwritten by a slower
+   * request that never saw it.
+   */
+  expectedTranslationRevision?: number | null;
+}
+
+export function isTranslationJobOperation(
+  value: unknown,
+): value is TranslationJobOperation {
+  return (
+    typeof value === "string" &&
+    (TRANSLATION_JOB_OPERATIONS as readonly string[]).includes(value)
+  );
 }
 
 export type ProcessingJobParameters = TranslateJobParameters;

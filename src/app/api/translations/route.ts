@@ -59,3 +59,96 @@ export async function GET(request: NextRequest) {
     );
   }
 }
+
+/**
+ * Rewrites one line's translated text.
+ *
+ * Applied server-side against the stored record — the same shape as Part 8's
+ * dialogue edits — so validation, the duration recomputation and the revision
+ * check live in one place, and a browser can never write a document it derived
+ * from a stale copy.
+ *
+ * Only `translatedText` is editable here. The original line belongs to the
+ * dialogue and is corrected in the Transcript workspace; Translate never keeps
+ * a second copy of it.
+ */
+export async function PATCH(request: NextRequest) {
+  const projectId = request.nextUrl.searchParams.get("projectId");
+  const mediaId = request.nextUrl.searchParams.get("mediaId");
+  const sourceLanguage = request.nextUrl.searchParams.get("sourceLanguage");
+  const targetLanguage = request.nextUrl.searchParams.get("targetLanguage");
+
+  if (!projectId || !mediaId) {
+    return errorResponse(
+      "INVALID_REQUEST",
+      "A project and source media are required.",
+      400,
+    );
+  }
+
+  if (!isLanguageCode(sourceLanguage) || !isLanguageCode(targetLanguage)) {
+    return errorResponse(
+      "INVALID_REQUEST",
+      "A source and target language are required.",
+      400,
+    );
+  }
+
+  let body: unknown;
+
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse("INVALID_REQUEST", "The edit could not be read.", 400);
+  }
+
+  const record = (typeof body === "object" && body !== null ? body : {}) as {
+    segmentId?: unknown;
+    translatedText?: unknown;
+    expectedRevision?: unknown;
+  };
+
+  if (
+    typeof record.segmentId !== "string" ||
+    record.segmentId.trim().length === 0 ||
+    typeof record.translatedText !== "string"
+  ) {
+    return errorResponse("INVALID_REQUEST", "That edit is not supported.", 400);
+  }
+
+  try {
+    const outcome = await translationService.editSegmentText(
+      projectId,
+      mediaId,
+      { sourceLanguage, targetLanguage },
+      record.segmentId,
+      record.translatedText,
+      Number.isInteger(record.expectedRevision)
+        ? (record.expectedRevision as number)
+        : null,
+    );
+
+    if (!outcome.ok) {
+      return Response.json(
+        { error: { code: outcome.code, message: outcome.message } },
+        {
+          status:
+            outcome.code === "TRANSLATION_NOT_FOUND" ||
+            outcome.code === "TRANSLATION_SEGMENT_NOT_FOUND"
+              ? 404
+              : outcome.code === "TRANSLATION_REVISION_CONFLICT"
+                ? 409
+                : 400,
+        },
+      );
+    }
+
+    return Response.json({ translation: outcome.translation });
+  } catch {
+    return errorResponse(
+      "INTERNAL_ERROR",
+      "The change could not be saved.",
+      500,
+    );
+  }
+}

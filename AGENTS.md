@@ -138,8 +138,31 @@ Non-negotiables for new work:
   never deleted and never presented as current.
 - Usage, provider model and confidence are recorded only where a provider
   genuinely reports them; an unmeasured value stays absent rather than zero.
-- Dubbing adaptation — shortening, expansion control, lip-sync phrasing, scene
-  context, alternate takes, timing fit — belongs to Part 10, not Part 9.
+- Translation context is built from the current editable dialogue by
+  `src/lib/translation/translation-context-builder.ts`: bounded, structured,
+  configurable in one place, and validated against the dialogue before every
+  provider call. Never build context ad hoc in a component or a handler.
+- Context is guidance only. A single-segment operation changes exactly one
+  translated line; a provider result naming a context-only segment is rejected,
+  never applied.
+- Speech duration is an **estimate from text** (`duration-estimator.ts`), never
+  measured audio. Its thresholds live in `duration-warning.ts` alone, and the
+  estimate is recomputed on every change to translated text, manual edits
+  included.
+- Never claim exact duration matching, TTS timing or lip sync. Timestamps are
+  never changed to fit a translation.
+- Manually edited translated text is authoritative: it is what Part 11 speaks,
+  and nothing overwrites it without explicit confirmation.
+- Segment regeneration and shortening keep the existing translation until a new
+  one is validated and stored; any failure leaves the previous text in place.
+- Segment operations carry the dialogue revision and the expected translation
+  revision, and refuse to write if either moved. A stale translation blocks
+  segment operations rather than being silently rebound.
+- No automatic re-compression loop: a line that still overruns is flagged for a
+  person, never retried until it fits.
+- Translation providers stay behind the Part 9 abstraction; the duration
+  estimator, the context builder, the repository and the Translate components
+  must never import a concrete provider.
 - Never fabricate confidence: unusable provider values become `null` and stay
   in `providerMetadata`.
 - Run `npm run lint`, `npm run typecheck`, `npm test` and `npm run build` before
