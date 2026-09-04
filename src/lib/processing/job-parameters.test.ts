@@ -127,3 +127,74 @@ describe("parseJobParameters", () => {
     expect(JSON.stringify(parsed)).not.toContain("secret");
   });
 });
+
+describe("parseJobParameters (generate_speech)", () => {
+  const speech = {
+    kind: "generate_speech",
+    operation: "full_project",
+    dialogueId: "dialogue-1",
+    translationId: "translation-1",
+    translationRevision: 4,
+    targetLanguage: "pl",
+    dialogueSegmentId: null,
+    regenerateAll: false,
+  };
+
+  it("accepts a well-formed speech request", () => {
+    expect(parseJobParameters(encode(speech))).toEqual(speech);
+  });
+
+  it("requires the translation the audio will be bound to", () => {
+    for (const broken of [
+      { ...speech, translationId: "" },
+      { ...speech, translationRevision: "4" },
+      { ...speech, translationRevision: -1 },
+      { ...speech, dialogueId: "" },
+    ]) {
+      // Without both the id and the revision, a slow run could file audio of a
+      // line that has since been rewritten.
+      expect(parseJobParameters(encode(broken))).toBeNull();
+    }
+  });
+
+  it("refuses a single-segment run that names no line", () => {
+    expect(
+      parseJobParameters(
+        encode({ ...speech, operation: "single_segment", dialogueSegmentId: null }),
+      ),
+    ).toBeNull();
+
+    expect(
+      parseJobParameters(
+        encode({
+          ...speech,
+          operation: "single_segment",
+          dialogueSegmentId: "seg-2",
+        }),
+      ),
+    ).toMatchObject({ operation: "single_segment", dialogueSegmentId: "seg-2" });
+  });
+
+  it("rejects an operation it does not know", () => {
+    expect(parseJobParameters(encode({ ...speech, operation: "everything" }))).toBeNull();
+    // Unlike translate, there is no default: a speech run always says its scope.
+    expect(
+      parseJobParameters(encode({ ...speech, operation: undefined })),
+    ).toBeNull();
+  });
+
+  it("rejects a language Aidub does not know", () => {
+    expect(
+      parseJobParameters(encode({ ...speech, targetLanguage: "xx" })),
+    ).toBeNull();
+  });
+
+  it("keeps only the fields it recognises", () => {
+    const parsed = parseJobParameters(
+      encode({ ...speech, providerId: "sneaky", apiKey: "secret" }),
+    );
+
+    expect(parsed).toEqual(speech);
+    expect(JSON.stringify(parsed)).not.toContain("secret");
+  });
+});

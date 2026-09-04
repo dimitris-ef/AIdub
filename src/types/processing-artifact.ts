@@ -10,6 +10,8 @@
 export const PROCESSING_ARTIFACT_TYPES = [
   "extracted_audio",
   "converted_media",
+  /** One dubbed line, produced by a `generate_speech` job. */
+  "generated_speech",
 ] as const;
 
 export type ProcessingArtifactType =

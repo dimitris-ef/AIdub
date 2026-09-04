@@ -1,5 +1,6 @@
 import { isLanguageCode } from "@/lib/languages";
 import {
+  isSpeechJobOperation,
   isTranslationJobOperation,
   type ProcessingJobParameters,
 } from "@/types/processing-job";
@@ -36,6 +37,10 @@ export function parseJobParameters(
   const record = (
     typeof parsed === "object" && parsed !== null ? parsed : {}
   ) as Record<string, unknown>;
+
+  if (record.kind === "generate_speech") {
+    return parseSpeechParameters(record);
+  }
 
   if (record.kind !== "translate") {
     return null;
@@ -90,5 +95,61 @@ export function parseJobParameters(
     targetLanguage: record.targetLanguage,
     segmentId,
     expectedTranslationRevision,
+  };
+}
+
+/**
+ * A speech job's inputs.
+ *
+ * The translation id and revision are what bind a run to exactly the text
+ * someone reviewed: without both, a slow request could file audio of a line
+ * that has since been rewritten. Anything malformed becomes no parameters at
+ * all, and the service rejects the job rather than speaking something the
+ * request did not actually name.
+ */
+function parseSpeechParameters(
+  record: Record<string, unknown>,
+): ProcessingJobParameters | null {
+  if (
+    typeof record.dialogueId !== "string" ||
+    record.dialogueId.trim().length === 0 ||
+    typeof record.translationId !== "string" ||
+    record.translationId.trim().length === 0 ||
+    !Number.isInteger(record.translationRevision) ||
+    (record.translationRevision as number) < 0 ||
+    !isLanguageCode(record.targetLanguage)
+  ) {
+    return null;
+  }
+
+  const operation = isSpeechJobOperation(record.operation)
+    ? record.operation
+    : null;
+
+  if (!operation) {
+    return null;
+  }
+
+  const dialogueSegmentId =
+    typeof record.dialogueSegmentId === "string" &&
+    record.dialogueSegmentId.trim().length > 0
+      ? record.dialogueSegmentId
+      : null;
+
+  // A single-segment run acts on exactly one line; naming none would leave the
+  // backend to choose, which it must never do.
+  if (operation === "single_segment" && !dialogueSegmentId) {
+    return null;
+  }
+
+  return {
+    kind: "generate_speech",
+    operation,
+    dialogueId: record.dialogueId,
+    translationId: record.translationId,
+    translationRevision: record.translationRevision as number,
+    targetLanguage: record.targetLanguage,
+    dialogueSegmentId,
+    regenerateAll: record.regenerateAll === true,
   };
 }

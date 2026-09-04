@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { copyFile, mkdir, readFile, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { ProcessingArtifact } from "@/types/processing-artifact";
@@ -8,6 +8,7 @@ import { defaultTempRoot } from "@/server/processing/temporary-file-manager";
 import type {
   ArtifactQuery,
   ProcessingArtifactStorage,
+  SaveArtifactBytesInput,
   SaveArtifactInput,
 } from "@/server/artifacts/processing-artifact-storage";
 
@@ -42,14 +43,29 @@ export class DevelopmentArtifactStorage implements ProcessingArtifactStorage {
   }
 
   async save(input: SaveArtifactInput): Promise<ProcessingArtifact> {
+    return this.store(input, (destination) =>
+      // Copy out of the job directory before that directory is cleaned up.
+      copyFile(input.sourcePath, destination),
+    );
+  }
+
+  async saveBytes(input: SaveArtifactBytesInput): Promise<ProcessingArtifact> {
+    return this.store(input, (destination) =>
+      writeFile(destination, input.data),
+    );
+  }
+
+  private async store(
+    input: Omit<SaveArtifactInput, "sourcePath">,
+    write: (destination: string) => Promise<void>,
+  ): Promise<ProcessingArtifact> {
     const id = (this.options.createId ?? randomUUID)();
     const directory = this.artifactDirectory(id);
     const destination = path.join(directory, input.filename);
 
     try {
       await mkdir(directory, { recursive: true });
-      // Copy out of the job directory before that directory is cleaned up.
-      await copyFile(input.sourcePath, destination);
+      await write(destination);
     } catch (cause) {
       throw new ProcessingError(
         "ARTIFACT_STORAGE_ERROR",

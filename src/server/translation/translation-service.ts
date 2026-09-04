@@ -245,6 +245,76 @@ export class TranslationService implements StageRunner {
   }
 
   /**
+   * The current translation into one target language, whatever it came from.
+   *
+   * Speech generation knows what language it is dubbing into but has no
+   * business knowing which source language a translation was made from — that
+   * is recorded on the translation itself. Resolving by target alone keeps
+   * translation staleness reasoning here, in the layer that owns it, rather
+   * than being re-derived by every consumer.
+   */
+  async resolveForTarget(
+    projectId: string,
+    sourceMediaId: string,
+    targetLanguage: string,
+  ): Promise<TranslationResolution> {
+    const resolution = await this.dialogues.getCurrentDialogue(
+      projectId,
+      sourceMediaId,
+    );
+
+    if (resolution.state !== "ready" || !resolution.dialogue) {
+      return {
+        state: "dialogue_required",
+        translation: null,
+        dialogue: null,
+        details: resolution.state,
+      };
+    }
+
+    const dialogue = resolution.dialogue;
+    const summary = {
+      id: dialogue.id,
+      revision: dialogue.editMetadata.revision,
+      segmentCount: dialogue.segments.length,
+    };
+    const candidates = (
+      await this.translations
+        .listByDialogue(projectId, dialogue.id)
+        .catch(() => [])
+    ).filter((translation) => translation.targetLanguage === targetLanguage);
+
+    if (candidates.length === 0) {
+      return { state: "not_translated", translation: null, dialogue: summary };
+    }
+
+    // `listByDialogue` is newest first, so the first exact-revision match is
+    // the current one; falling back to the newest lets the caller present a
+    // stale translation *as* stale rather than as nothing at all.
+    const exact = candidates.find(
+      (translation) =>
+        translation.dialogueRevision === dialogue.editMetadata.revision,
+    );
+
+    if (exact) {
+      return { state: "ready", translation: exact, dialogue: summary };
+    }
+
+    const previous = candidates[0];
+    const currency = translationCurrency(previous, dialogue, {
+      sourceLanguage: previous.sourceLanguage,
+      targetLanguage,
+    });
+
+    return {
+      state: currency.current ? "ready" : "stale",
+      translation: previous,
+      dialogue: summary,
+      ...(currency.current ? {} : { staleReason: currency.reason }),
+    };
+  }
+
+  /**
    * The translation to show for this dialogue and language pair right now.
    *
    * Returns the stored record plus whether it is still current, so the caller

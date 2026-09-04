@@ -24,6 +24,20 @@ export interface SaveArtifactInput {
   durationSeconds?: number | null;
 }
 
+/**
+ * The same artifact, handed over as bytes rather than as a file.
+ *
+ * FFmpeg writes files, so `save` takes a path. A synthesis provider returns a
+ * buffer, and making it invent a temp file just to produce a path would put
+ * filesystem concerns back into a service that has no business knowing about
+ * them — the very thing this abstraction exists to prevent. Object storage in
+ * production takes bytes natively, so this is the more primitive of the two.
+ */
+export interface SaveArtifactBytesInput
+  extends Omit<SaveArtifactInput, "sourcePath"> {
+  data: Uint8Array;
+}
+
 export interface ArtifactQuery {
   projectId: string;
   sourceMediaId?: string;
@@ -32,6 +46,7 @@ export interface ArtifactQuery {
 
 export interface ProcessingArtifactStorage {
   save(input: SaveArtifactInput): Promise<ProcessingArtifact>;
+  saveBytes(input: SaveArtifactBytesInput): Promise<ProcessingArtifact>;
   get(artifactId: string): Promise<ProcessingArtifact | null>;
   /** Artifacts matching a scope, newest first. */
   list(query: ArtifactQuery): Promise<ProcessingArtifact[]>;

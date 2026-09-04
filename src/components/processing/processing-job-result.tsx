@@ -56,6 +56,21 @@ export function ProcessingJobResultDetails({
     );
   }
 
+  if (result.kind === "generate_speech") {
+    // Skipped lines are counted separately from failures on purpose: a line
+    // with nothing to say is a correct outcome, not a problem to look into.
+    const parts = [
+      `${result.generatedCount} spoken ${result.generatedCount === 1 ? "line" : "lines"}`,
+      result.skippedCount > 0 ? `${result.skippedCount} silent` : null,
+      result.failedCount > 0 ? `${result.failedCount} failed` : null,
+      result.providerModel ?? result.providerId,
+    ].filter(Boolean);
+
+    return (
+      <p className="text-xs text-muted-foreground">{parts.join(" · ")}</p>
+    );
+  }
+
   const { artifact } = result;
   const parts = [
     "WAV",

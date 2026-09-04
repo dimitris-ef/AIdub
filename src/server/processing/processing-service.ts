@@ -31,6 +31,8 @@ import type { TranscriptRepository } from "@/data/transcripts";
 import type { DiarizationRepository } from "@/data/diarization";
 import type { UnifiedDialogueRepository } from "@/data/dialogue";
 import type { TranslationRepository } from "@/data/translations";
+import type { GeneratedSpeechRepository } from "@/data/tts/generated-speech-repository";
+import type { VoiceAssignmentRepository } from "@/data/tts/voice-assignment-repository";
 import type {
   ProcessingMediaSource,
   MaterializeSourceRequest,
@@ -115,6 +117,8 @@ export interface ProcessingServiceOptions {
   diarization?: DiarizationRunner;
   /** Handles "translate" jobs; absent means translation is unavailable. */
   translation?: StageRunner;
+  /** Handles "generate_speech" jobs; absent means TTS is unavailable. */
+  speech?: StageRunner;
   /** Lets project/media cleanup dispose of transcripts too. */
   transcripts?: TranscriptRepository;
   /** Lets project/media cleanup dispose of diarization results too. */
@@ -123,6 +127,10 @@ export interface ProcessingServiceOptions {
   dialogues?: UnifiedDialogueRepository;
   /** Lets project/media cleanup dispose of translations too. */
   translations?: TranslationRepository;
+  /** Lets project/media cleanup dispose of generated speech too. */
+  generatedSpeech?: GeneratedSpeechRepository;
+  /** Lets project/media cleanup dispose of voice assignments too. */
+  voiceAssignments?: VoiceAssignmentRepository;
   logger?: (message: string, cause?: unknown) => void;
 }
 
@@ -139,10 +147,13 @@ export class ProcessingService {
   private readonly transcription?: TranscriptionRunner;
   private readonly diarization?: DiarizationRunner;
   private readonly translation?: StageRunner;
+  private readonly speech?: StageRunner;
   private readonly transcripts?: TranscriptRepository;
   private readonly diarizations?: DiarizationRepository;
   private readonly dialogues?: UnifiedDialogueRepository;
   private readonly translations?: TranslationRepository;
+  private readonly generatedSpeech?: GeneratedSpeechRepository;
+  private readonly voiceAssignments?: VoiceAssignmentRepository;
   private readonly logger: (message: string, cause?: unknown) => void;
   /** Live jobs, so they can be aborted. Never exposed to the frontend. */
   private readonly running = new Map<string, AbortController>();
@@ -156,10 +167,13 @@ export class ProcessingService {
     this.transcription = options.transcription;
     this.diarization = options.diarization;
     this.translation = options.translation;
+    this.speech = options.speech;
     this.transcripts = options.transcripts;
     this.diarizations = options.diarizations;
     this.dialogues = options.dialogues;
     this.translations = options.translations;
+    this.generatedSpeech = options.generatedSpeech;
+    this.voiceAssignments = options.voiceAssignments;
     this.logger = options.logger ?? defaultLogger;
   }
 
@@ -323,6 +337,16 @@ export class ProcessingService {
       // again, and leaving it would let it be mistaken for the new source's.
       await this.dialogues?.deleteByMedia(projectId, sourceMediaId);
       await this.translations?.deleteByMedia(projectId, sourceMediaId);
+      // Generated speech is derived from the translation, so it goes too — and
+      // its audio artifacts went with the deleteByMedia above.
+      await this.generatedSpeech?.deleteByMedia(projectId, sourceMediaId);
+      // Voice assignments go as well, even though they are the one thing here
+      // a person authored by hand. Canonical speaker ids are assigned by first
+      // appearance on the timeline, so a new source's `speaker_1` is a
+      // different person wearing the same id: keeping the old assignment would
+      // not preserve a casting decision, it would silently apply it to someone
+      // else. Asking again is the honest outcome.
+      await this.voiceAssignments?.deleteByMedia(projectId, sourceMediaId);
     } else {
       await this.artifacts.deleteByProject(projectId);
       await this.repository.deleteByProject(projectId);
@@ -330,6 +354,8 @@ export class ProcessingService {
       await this.diarizations?.deleteByProject(projectId);
       await this.dialogues?.deleteByProject(projectId);
       await this.translations?.deleteByProject(projectId);
+      await this.generatedSpeech?.deleteByProject(projectId);
+      await this.voiceAssignments?.deleteByProject(projectId);
     }
 
     return cancelled;
@@ -382,6 +408,13 @@ export class ProcessingService {
       throw new ProcessingError(
         "INVALID_REQUEST",
         "The translation request was incomplete.",
+      );
+    }
+
+    if (request.type === "generate_speech" && !request.parameters) {
+      throw new ProcessingError(
+        "INVALID_REQUEST",
+        "The speech generation request was incomplete.",
       );
     }
 
@@ -459,7 +492,8 @@ export class ProcessingService {
         return this.runStage(this.diarization, job, sourcePath, signal);
       }
 
-      case "translate": {
+      case "translate":
+      case "generate_speech": {
         // Unreachable: media-free types are handled before this switch. Kept
         // so the exhaustiveness check keeps working as job types are added.
         return this.executeWithoutMedia(job, signal);
@@ -477,21 +511,9 @@ export class ProcessingService {
     job: ProcessingJob,
     signal: AbortSignal,
   ): Promise<ProcessingJob["result"]> {
-    if (job.type !== "translate") {
-      throw new ProcessingError(
-        "UNSUPPORTED_JOB_TYPE",
-        "This processing operation is not supported.",
-      );
-    }
+    const runner = this.mediaFreeRunner(job.type);
 
-    if (!this.translation) {
-      throw new ProcessingError(
-        "TRANSLATION_PROVIDER_UNAVAILABLE",
-        "Translation is not available on this server.",
-      );
-    }
-
-    return this.translation.run({
+    return runner.run({
       job,
       signal,
       ensureAudio: () => {
@@ -502,6 +524,40 @@ export class ProcessingService {
       },
       onProgress: (progress, stage) => this.reportProgress(job.id, progress, stage),
     });
+  }
+
+  /**
+   * The stage that handles a media-free job type, or a clear failure saying
+   * this server cannot run it. Each type resolves to its own runner: translation
+   * and speech are independent stages that happen to share a lifecycle.
+   */
+  private mediaFreeRunner(type: ProcessingJobType): StageRunner {
+    if (type === "translate") {
+      if (!this.translation) {
+        throw new ProcessingError(
+          "TRANSLATION_PROVIDER_UNAVAILABLE",
+          "Translation is not available on this server.",
+        );
+      }
+
+      return this.translation;
+    }
+
+    if (type === "generate_speech") {
+      if (!this.speech) {
+        throw new ProcessingError(
+          "TTS_PROVIDER_UNAVAILABLE",
+          "Speech generation is not available on this server.",
+        );
+      }
+
+      return this.speech;
+    }
+
+    throw new ProcessingError(
+      "UNSUPPORTED_JOB_TYPE",
+      "This processing operation is not supported.",
+    );
   }
 
   /**

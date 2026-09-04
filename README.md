@@ -2264,17 +2264,254 @@ changed to fit a translation), no lip sync or phoneme alignment, no source
 separation, and no dubbed audio or video render. Duration awareness is
 preparation for Part 11, not synchronisation.
 
+## Part 11: Text-to-Speech Foundation
+
+Part 10 produced reviewed, dubbing-oriented translated text and an estimate of
+whether each line would fit. Part 11 speaks it. It turns the current translation
+into actual audio: a voice per character, a generated line per dialogue segment,
+stored so a person can play it against the original and hear what the dub sounds
+like.
+
+It is the provider-independent foundation the later parts build on, and it stops
+there. Part 11 does **not** clone a voice, align speech to the original timing,
+separate the source audio, mix anything, or export a dubbed video.
+
+### Speech architecture
+
+```
+Current translation (Part 10)
+        │
+        ▼
+SpeakerVoiceAssignment  ← a person casts each speaker
+        │
+        ▼
+generate_speech job ──► TtsGenerationService
+                              │
+                              ├─► TtsProvider  (local-vits │ mock │ …)
+                              │        └─ worker thread, blocking native call
+                              ├─► ProcessingArtifactStorage  (the audio bytes)
+                              └─► GeneratedSpeechRepository  (the metadata)
+```
+
+Five things are kept apart on purpose:
+
+- **who is speaking** — `DialogueSpeaker.id`, decided by Parts 6–8;
+- **what voice exists** — `TtsVoice.id`, a provider's own catalog entry;
+- **who is cast as what** — `SpeakerVoiceAssignment`, the only record that links
+  the two, and the only one a person authors;
+- **what was generated** — `GeneratedSpeechSegment`, metadata and provenance;
+- **the audio itself** — a `generated_speech` artifact in the shared store.
+
+Conflating the first two would make a voice change look like a speaker change.
+Conflating the last two would make every read of the workspace pull megabytes of
+base64.
+
+### The input is the edited translation, never raw STT
+
+Speech generation reads the **current `DialogueTranslation`** — the text a person
+reviewed, edited, regenerated or shortened in Part 10. It never reads the Part 5
+transcript, the Part 6 diarization, or even the dialogue's own `originalText`.
+A manual correction someone made to a translated line is exactly what gets
+spoken.
+
+It also never writes upstream. The translation, dialogue, transcript and
+diarization are read and copied; generated audio is a separate record, and the
+service literally cannot reach those stores to modify them. Generated audio is
+**derived**: it can always be produced again.
+
+### Provider abstraction
+
+`TtsProvider` in `src/server/tts/tts-provider.ts` is the boundary. Above it, the
+generation service, the job and the Voices workspace speak only in Aidub's terms.
+Below it, one adapter owns model names, endpoints, credentials, audio containers,
+SSML dialects, native runtimes and retries.
+
+It is deliberately not HTTP-shaped: a provider may call a hosted API, run a model
+on this machine, or hand work to a GPU worker, and the abstraction has to survive
+all three.
+
+A provider speaks one line. It never chooses a voice, never merges or splits
+lines, never moves a timestamp, and never sees the project's dialogue. One line
+per call rather than a batch, so a failure costs one line rather than a run,
+cancellation lands between lines, and progress is real.
+
+`TtsProviderCapabilities` lets a provider say what it actually honours.
+`applicableSettings` then drops the rest, so a stored record never claims a
+speaking rate that never applied.
+
+Two adapters ship:
+
+- **`local-vits`** — a real, self-hosted Piper VITS model via `sherpa-onnx-node`.
+  Runs on CPU, on this machine. No audio and no dialogue leaves the machine, no
+  credentials are involved, nothing is billed. Models come from a public GitHub
+  release via `npm run setup:tts` (~250 MB, gitignored, never committed). The
+  runtime and the models are both optional: `isAvailable()` reports false when
+  either is missing, so Aidub builds and runs without them and the workspace says
+  so plainly.
+- **`mock`** — deterministic, development-only, produces real playable WAV so the
+  whole path can be exercised without a download. It is **not speech** and nothing
+  it returns should ever be presented as dubbed audio. Registered only when named
+  explicitly by `AIDUB_TTS_PROVIDER`, so it can never become a silent fallback.
+
+`AIDUB_TTS_PROVIDER` selects the default in one place. Adding a provider is a
+registry change: no domain code, no persisted model, no job change, no UI change.
+
+### Blocking native calls run off the request thread
+
+Synthesis is one blocking native call per line — hundreds of milliseconds each,
+hundreds of lines per project. On the main thread it would freeze the Node event
+loop for the whole run: no request served, including the cancel the user just
+clicked.
+
+So it runs on a worker thread (`local-vits-worker.ts`), and **cancellation
+detaches rather than kills** — the same rule Part 6 established. The native call
+cannot be interrupted, and terminating a worker mid-call tears down a thread the
+addon is still using, which aborts the entire process. An aborted line frees the
+caller immediately and abandons the worker; it finishes on its own, its result is
+never read, and being unref'd it holds nothing open. That worker boundary is also
+the seam a remote GPU worker slots into later.
+
+### Voice assignment
+
+A `SpeakerVoiceAssignment` is keyed by the **stable** `speakerId`, so renaming a
+speaker in Transcript changes nothing, and reassigning a line to another speaker
+changes which voice speaks it without anyone re-picking. The record's id is
+derived from dialogue + language + speaker, so re-casting replaces one record
+rather than leaving rivals to disagree.
+
+**Aidub never chooses a voice.** Not from the audio, not from a name, not from
+the diarization, not from the transcript, and not from any inferred attribute of
+a speaker. Those would be guesses about people. A voice is whatever a person
+picked after listening, and a speaker with no voice stops a run rather than being
+cast automatically. The catalog is the same list for every speaker; the only
+thing that differs is the choice.
+
+`VoiceSource` is a discriminated union with one member today. Part 12's cloned
+voices arrive as a new variant, not a rewrite of every stored assignment — and a
+record naming a variant this build does not understand is rejected on read rather
+than loaded as a standard voice and spoken in the wrong one.
+
+### Staleness
+
+`src/lib/tts/tts-staleness.ts` answers "is this audio still what the project
+currently says?" in one place, because the failure mode is silent: a dubbed line
+that plays confidently while speaking a sentence the user rewrote, in the voice
+they replaced.
+
+Audio goes out of date when the translated text or its edit revision changes, the
+whole translation is replaced, the line's speaker changes, the voice or its
+settings change, the target language changes, or the storage schema changes. All
+of those are folded into one `fingerprint` at generation time, so the check is one
+equality comparison — with individual comparisons afterwards purely so the
+workspace can say *what* changed rather than just "outdated".
+
+**Stale never means deleted.** The audio stays stored and stays playable; it is
+simply not what a later mix should use, and the workspace says so.
+
+A line with nothing to say — empty, or punctuation only — is recorded as
+`skipped_empty` rather than skipped: the structure stays 1:1 with the translation,
+no provider call is spent on an ellipsis, and no silence file is generated. The
+same `hasSpeakableText` predicate decides this for both the service and the
+staleness check, so such a line settles as current instead of being regenerated
+forever.
+
+### Duration is measured, never corrected
+
+Part 10 estimated a line's length from text. Part 11 has the real thing: an
+actual measured duration of actual audio, read from the WAV header when a provider
+does not report one. Both are kept — they answer different questions, and
+overwriting the estimate would lose the record of what was predicted.
+
+Where generated speech runs longer than its dialogue window, that is recorded as a
+warning and shown as two durations plus their ratio. **That is all Part 11 does
+about it.** No stretching, no compressing, no rate adjustment, no moved
+timestamps, no automatic retry loop. Making a line fit is Part 10's "Make
+shorter", which is a person's decision.
+
+### Processing jobs
+
+Speech generation is a `generate_speech` job in the shared job architecture —
+never a second job system. Two operations share it because they differ in scope,
+not lifecycle: `full_project` speaks everything that needs speaking,
+`single_segment` speaks exactly one line and leaves every other record
+byte-identical.
+
+Like `translate`, it carries **no source media**: it reads the translation the
+backend already holds, so no video crosses the network to generate speech.
+
+The job names the exact translation id and revision it was created for, and that
+is re-checked at the end of a run as well as the start — a full run takes minutes,
+and a translation edited during it must not have audio of its old text filed as
+current.
+
+A run refuses up front if any speaker with spoken lines has no voice: discovering
+that at line 80 of 100 wastes 79 provider calls and leaves a half-dubbed project.
+A failure on one line is recorded, not thrown — one hiccup must not discard the
+lines that worked — and the previous take, bytes and all, survives it. New audio
+is stored before the take it replaces is released.
+
+### Artifact access
+
+Audio bytes live in the shared `ProcessingArtifactStorage` behind an
+`artifactId`, added via `saveBytes` (FFmpeg writes files; a synthesis provider
+returns a buffer, and making it invent a temp file would put filesystem concerns
+back into a service that has no business knowing about them).
+
+Playback is checked **twice**: the generated record must belong to the project
+that asked for it, and the artifact must belong to that project too. Either check
+alone leaves a hole — a guessed record id without the first, a guessed artifact id
+without the second — and record ids here are derived from dialogue segment ids
+rather than random, so guessability is a real property, not a hypothetical.
+Filenames are built entirely from backend identifiers, and no response carries a
+filesystem path.
+
+### Credentials
+
+Speech providers are constructed and called **server-side only**. No API key,
+private token or model URL reaches `NEXT_PUBLIC_*`, a browser bundle, a client
+component, a stored record, or a log line. Logs carry identifiers, counts and
+durations — never translated text, never a credential, never a model path.
+
+### Voices workspace
+
+`/projects/[projectId]/voices` is the section. It shows the cast list, generates
+speech, plays each dubbed line against the original on the shared player, and
+reports where a line runs long or has gone out of date. It knows nothing about
+which provider runs, whether it is local or hosted, or what a call costs.
+
+Voice previews use fixed neutral text rather than the character's own lines: an
+audition is about hearing the voice, and it should never be mistakable for a
+generated take. Preview audio is returned directly and never stored — it is not
+part of the project.
+
+### Production architecture
+
+`TtsGenerationService` takes a job context and repositories, not an HTTP request,
+so moving generation to an external worker stays a deployment change. Both
+development stores (temp-directory JSON) sit behind interfaces a database
+replaces without touching the service or the workspace — and of everything Part 11
+stores, the voice assignments most want a real one, because a lost casting
+decision cannot be recomputed.
+
+### Explicit non-goals
+
+Part 11 implements **no** voice cloning, no reference-recording capture, no timing
+alignment or synchronisation of generated speech to the original, no lip sync, no
+audio time-stretching or compression, no source separation, no mixing with the
+original audio, and no dubbed audio or video export. It generates speech, stores
+it, and reports honestly where it does not fit.
+
 ## Not implemented (on purpose)
 
 Authentication, accounts, billing, a production database, cloud media storage,
 transcoding for delivery, proxy or thumbnail generation, waveform generation,
-real queues and external workers, source separation, TTS, voice generation and
-cloning, speaker naming or identity recognition, timing alignment, lip sync,
-the dubbing/mixing timeline, export/render processing, analytics and
-collaboration are all still out of scope. Part 10 stops at reviewed, dubbing-
-oriented translated text: each corrected dialogue line has a target-language
-counterpart a person can edit, regenerate or shorten, with an estimate of
-whether it will fit — and nothing is synthesised, aligned or mixed. There are no placeholder or mock API routes for those
+real queues and external workers, source separation, voice cloning, speaker
+naming or identity recognition, timing alignment, lip sync, audio
+time-stretching, the dubbing/mixing timeline, export/render processing,
+analytics and collaboration are all still out of scope. Part 11 stops at
+generated speech: each reviewed translated line has dubbed audio a person can
+play against the original, in a voice they cast, with an honest measurement of
+where it runs long — and nothing is aligned, mixed or exported. There are no placeholder or mock API routes for those
 features. Project and media persistence exist only in the temporary
 browser-local forms described above.
 
@@ -2556,3 +2793,45 @@ Part 10 adds:
 133. Full and segment-level operations share the one processing-job
      architecture; translation persistence stays provider-independent and
      replaceable.
+
+Part 11 adds:
+
+134. Speech generation consumes the **current edited translation**, never raw
+     STT, the diarization or the dialogue's original text, and never writes to
+     any of them.
+135. Providers stay behind `TtsProvider` in `src/server/tts/`; model names,
+     endpoints, credentials, audio formats and retries never leak into the TTS
+     model, a stored record or any component. The default comes from
+     `AIDUB_TTS_PROVIDER`.
+136. Voice cloning is **not** implemented. `VoiceSource` carries a discriminant
+     so Part 12 adds a variant rather than a rewrite, and a variant this build
+     does not understand is rejected on read.
+137. Aidub never selects a voice from any inferred attribute of a speaker — not
+     from audio, name, diarization or transcript. A voice is a person's choice,
+     and an uncast speaker stops a run.
+138. Voice assignments are keyed by the stable `speakerId` and are the one
+     Part 11 record that cannot be recomputed; an unreadable one is skipped, and
+     never replaced with a guess.
+139. Generated audio is derived. Metadata lives in `GeneratedSpeechRepository`;
+     the bytes live in the shared artifact store behind `artifactId`.
+140. Staleness is decided in one place by a fingerprint over text, revision,
+     speaker, voice, settings, language and schema. Stale audio is surfaced,
+     never deleted and never served as current.
+141. A line with no speakable text is recorded as intentionally silent, by the
+     same predicate the generation service uses, so it settles as current.
+142. Speech generation is a `generate_speech` job in the shared job architecture
+     — never a second job system — and carries no source media.
+143. Blocking native synthesis runs on a worker thread; a cancelled run is
+     detached rather than terminated.
+144. Generated duration is **measured**, never corrected. Part 11 reports that a
+     line overruns its window and does nothing else about it: no stretching, no
+     compression, no rate adjustment, no moved timestamps, no retry loop.
+145. A failed line keeps the audio a person already had; new audio commits before
+     the take it replaces is released.
+146. Artifact access is validated against the project on both the generated
+     record and the artifact; no response exposes a backend filesystem path.
+147. Provider credentials stay server-side and never reach the browser, a stored
+     record or a log line.
+148. Part 12 and later consume generated speech and its measured durations;
+     alignment, mixing and export must not modify the translation, the dialogue
+     or the voice assignments.

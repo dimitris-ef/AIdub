@@ -14,6 +14,7 @@ export const PROCESSING_JOB_TYPES = [
   "transcribe",
   "diarize",
   "translate",
+  "generate_speech",
 ] as const;
 
 export type ProcessingJobType = (typeof PROCESSING_JOB_TYPES)[number];
@@ -87,6 +88,24 @@ export const PROCESSING_ERROR_CODES = [
   "TRANSLATION_REVISION_CONFLICT",
   "TRANSLATION_NOT_FOUND",
   "TRANSLATION_CANCELLED",
+  "TTS_PROVIDER_UNAVAILABLE",
+  "TTS_AUTHENTICATION_FAILED",
+  "TTS_RATE_LIMITED",
+  "TTS_REQUEST_FAILED",
+  "TTS_TIMEOUT",
+  "TTS_UNSUPPORTED_LANGUAGE",
+  "TTS_VOICE_NOT_FOUND",
+  "TTS_INVALID_REQUEST",
+  "TTS_GENERATION_FAILED",
+  "TTS_INVALID_AUDIO_RESPONSE",
+  "TTS_STORAGE_FAILED",
+  "TTS_SOURCE_CHANGED",
+  "TTS_TRANSLATION_REQUIRED",
+  "TTS_TRANSLATION_STALE",
+  "TTS_VOICE_ASSIGNMENT_REQUIRED",
+  "TTS_SPEAKER_UNASSIGNED",
+  "TTS_SEGMENT_NOT_FOUND",
+  "TTS_CANCELLED",
   "AUDIO_EXTRACTION_FAILED",
   "CONVERSION_FAILED",
   "TEMP_STORAGE_ERROR",
@@ -182,6 +201,28 @@ export interface TranslateJobResult {
   providerModel: string | null;
 }
 
+/**
+ * Speech generation references the saved records rather than repeating them:
+ * the generated lines are persisted in their own store, their audio lives in
+ * artifact storage, and both outlive the job.
+ *
+ * The counts are what a person needs to know a run finished honestly: how many
+ * lines were spoken, how many were intentionally silent, and how many failed. A
+ * run that could not speak every line still completes — a partial result with
+ * the failures named beats losing the lines that did work.
+ */
+export interface GenerateSpeechJobResult {
+  kind: "generate_speech";
+  dialogueId: string;
+  translationId: string;
+  targetLanguage: string;
+  generatedCount: number;
+  skippedCount: number;
+  failedCount: number;
+  providerId: string;
+  providerModel: string | null;
+}
+
 export type ProcessingJobResult =
   | ProbeJobResult
   | ExtractAudioJobResult
@@ -189,6 +230,7 @@ export type ProcessingJobResult =
   | TranscribeJobResult
   | DiarizationJobResult
   | TranslateJobResult
+  | GenerateSpeechJobResult
   | null;
 
 /**
@@ -246,15 +288,65 @@ export function isTranslationJobOperation(
   );
 }
 
-export type ProcessingJobParameters = TranslateJobParameters;
+/**
+ * What a speech-generation job is being asked to do.
+ *
+ * Both share one job type rather than becoming separate systems: they differ in
+ * scope, not in lifecycle. A full-project run replaces every line's audio; a
+ * single-segment run replaces exactly one and leaves the rest untouched.
+ */
+export const SPEECH_JOB_OPERATIONS = ["full_project", "single_segment"] as const;
+
+export type SpeechJobOperation = (typeof SPEECH_JOB_OPERATIONS)[number];
+
+export interface GenerateSpeechJobParameters {
+  kind: "generate_speech";
+  operation: SpeechJobOperation;
+  /** The exact dialogue the job was created against. */
+  dialogueId: string;
+  /** The exact translation whose text is being spoken. */
+  translationId: string;
+  /**
+   * The translation revision the request was built against.
+   *
+   * The run refuses to store its result if the translation has moved on since —
+   * audio of a line someone has already rewritten must never be filed as
+   * current.
+   */
+  translationRevision: number;
+  targetLanguage: string;
+  /** The line to speak. Required by `single_segment`, null for a full run. */
+  dialogueSegmentId?: string | null;
+  /**
+   * Speak every line again, including ones whose audio is still current.
+   *
+   * Default false, so a full run after a few edits pays for the few lines that
+   * changed rather than re-synthesising a whole project.
+   */
+  regenerateAll?: boolean;
+}
+
+export function isSpeechJobOperation(
+  value: unknown,
+): value is SpeechJobOperation {
+  return (
+    typeof value === "string" &&
+    (SPEECH_JOB_OPERATIONS as readonly string[]).includes(value)
+  );
+}
+
+export type ProcessingJobParameters =
+  | TranslateJobParameters
+  | GenerateSpeechJobParameters;
 
 /**
  * Job types that consume the source media itself. Everything else works from
- * data the backend already holds — a translation reads the stored dialogue, so
- * it neither needs nor accepts a video upload.
+ * data the backend already holds — a translation reads the stored dialogue and
+ * speech generation reads the stored translation, so neither needs nor accepts
+ * a video upload.
  */
 export function jobTypeNeedsSourceMedia(type: ProcessingJobType): boolean {
-  return type !== "translate";
+  return type !== "translate" && type !== "generate_speech";
 }
 
 export interface ProcessingJob {

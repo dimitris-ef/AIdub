@@ -55,6 +55,7 @@ const JOB_TYPE_LABELS: Record<ProcessingJobType, string> = {
   transcribe: "Transcribe speech",
   diarize: "Analyse speakers",
   translate: "Translate dialogue",
+  generate_speech: "Generate speech",
 };
 
 export function getJobTypeLabel(type: ProcessingJobType | string): string {
